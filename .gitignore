@@ -22,3 +22,5 @@ examples/**/allreduce
 examples/**/allreduce_ub
 examples/**/allreduce_sm
 examples/**/allreduce_device_api
+
+compile_commands.json
