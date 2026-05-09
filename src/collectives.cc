@@ -8,6 +8,7 @@
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
 #include "enqueue.h"
+#include "include/nvtx.h"
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 
@@ -68,6 +69,7 @@ const char* ncclAlgoToString(int algo) {
   case NCCL_ALGO_NVLS: return "NVLS";
   case NCCL_ALGO_NVLS_TREE: return "NVLS_TREE";
   case NCCL_ALGO_PAT: return "PAT";
+  case NCCL_ALGO_BINE: return "BINE";
   default: return "Unknown";
   }
 }

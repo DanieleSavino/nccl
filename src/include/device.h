@@ -588,6 +588,9 @@ inline bool ncclNvlsSupported(int devRedOp, int type) {
   }
 }
 
+/**
+ * INFO: Added bine indexes, they are defined in generate.py
+ */
 // `ncclDevFuncIndex()` needs to be in sync with "all_functions()" in "src/device/generate.py"
 inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) {
   constexpr int NumTypes = ncclNumTypes;
@@ -602,15 +605,17 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                /*algo == NCCL_ALGO_PAT*/ 3;
+                  /** algo == NCCL_ALGO_PAT ? */ 3;
       row += algo1*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 1;
+    nAlgos = 2;
     if (coll == ncclFuncBroadcast) {
-      row += proto;
+      int algo1 = algo == NCCL_ALGO_RING ? 0 :
+        /** algo == NCCL_ALGO_BINE */ 1;
+      row += algo1*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
@@ -641,7 +646,7 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                /*algo == NCCL_ALGO_PAT*/ 3;
+                  algo == NCCL_ALGO_PAT ? 3;
       row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }

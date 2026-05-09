@@ -11,6 +11,7 @@
 #include "transport.h"
 #include "channel.h"
 #include <assert.h>
+#include <stdio.h>
 #include "bootstrap.h"
 #include "ce_coll.h"
 #include "profiler.h"
@@ -182,6 +183,23 @@ static ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConn
           NCCLCHECK(ncclTransportPatConnect(comm));
           break;
         }
+
+        /**
+         * INFO: [HLC] Added bine.
+         * FIXME: [HLC] Using this is fine for p2p communication,
+         * but might want to switch to a proper bine one once graph is complete.
+         */
+        case NCCL_ALGO_BINE: {
+          fprintf(stderr, "Using BINE\n");
+          for (int c = 0; c < comm->nChannels; c++) {
+              for (int r = 0; r < comm->nRanks; r++) {
+              NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &r, 1, &r, 0));
+            }
+          }
+          NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_BINE], 0));
+          break;
+        }
+
         // Yes, it's a dead code.  That's fine...
         // coverity[dead_error_begin]
         default: {
