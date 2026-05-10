@@ -158,6 +158,8 @@ ncclResult_t ncclCollnetDeregBuffer(struct ncclComm* comm, struct ncclProxyConne
 ncclResult_t ncclTransportRingConnect(struct ncclComm* comm);
 ncclResult_t ncclTransportTreeConnect(struct ncclComm* comm);
 ncclResult_t ncclTransportPatConnect(struct ncclComm* comm);
+// INFO: [HLC] bine transport.
+ncclResult_t ncclTransportBineConnect(struct ncclComm* comm);
 
 ncclResult_t ncclCollNetSetup(ncclComm_t comm, ncclComm_t parent, struct ncclTopoGraph* graphs[]);
 ncclResult_t ncclCollNetChainBufferSetup(ncclComm_t comm);

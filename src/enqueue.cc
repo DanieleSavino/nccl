@@ -20,6 +20,7 @@
 #include "scheduler.h"
 #include "compiler.h"
 #include "rma/rma.h"
+#include <stdio.h>
 
 #include <cstring> // std::memcpy
 #include <cinttypes> // PRIx64
@@ -2024,8 +2025,11 @@ static ncclResult_t topoGetAlgoInfo(
   nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;
   if (info->algorithm == NCCL_ALGO_TREE) nt = NCCL_MAX_NTHREADS; // Tree now uses all threads always.
   if (info->algorithm == NCCL_ALGO_PAT) nt = NCCL_MAX_NTHREADS;
+  if (info->algorithm == NCCL_ALGO_BINE) nt = NCCL_MAX_NTHREADS; // INFO: [HLC] Max threads for bine.
   info->nMaxChannels = nc;
   info->nWarps = nt/WARP_SIZE;
+
+
   return ncclSuccess;
 }
 
@@ -2593,6 +2597,7 @@ static ncclResult_t collTaskAppend(
   NCCLCHECK(ncclProfilerRecordGroupApiEventState(ncclProfilerGroupStartApiStop));
   NCCLCHECK(ncclProfilerStartCollApiEvent(info, isGraphCaptured));
 
+  // WARN: [HLC] Broadcast gets converted to scatterv + allgatherv here, to test bradcast run with NCCL_ALLGATHERV_ENABLE=0.
   if (info->coll == ncclFuncBroadcast && ncclParamAllgathervEnable() && !comm->ccEnable) {
     // Must be in thread local group before tasks can be alloc'd in `comm->memScoped`.
     struct ncclTaskBcast* t = ncclMemoryPoolAlloc<struct ncclTaskBcast>(&comm->memPool_ncclTaskBcast, &comm->memPermanent);

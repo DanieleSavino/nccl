@@ -38,6 +38,13 @@
 #include "os.h"
 #include "env.h"
 #include "rma/rma.h"
+#include <fcntl.h>
+#include <string.h>
+#include <assert.h>
+#include <dlfcn.h>
+#include <sys/types.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #define STR2(v) #v
 #define STR(v) STR2(v)
@@ -49,7 +56,8 @@
 #endif
 
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
-const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
+// INFO: [HLC] Added bine.
+const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT", "BINE" };
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
 
 NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
@@ -652,9 +660,47 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.channels[c].collnetChain = comm->channels[c].collnetChain;
     tmpCommAndChans.channels[c].collnetDirect = comm->channels[c].collnetDirect;
     tmpCommAndChans.channels[c].nvls = comm->channels[c].nvls;
+    // INFO: [HLC] Bine channels.
+    tmpCommAndChans.channels[c].bine = comm->channels[c].bine;
+    tmpCommAndChans.channels[c].bine.send = comm->channels[c].devBineSend;
+    tmpCommAndChans.channels[c].bine.recv = comm->channels[c].devBineRecv;
+    tmpCommAndChans.channels[c].bine.partners = comm->channels[c].devBinePartner;
+    tmpCommAndChans.channels[c].bine.index = comm->channels[c].devBineIndex;
+    tmpCommAndChans.channels[c].bine.order = comm->channels[c].devBineOrder;
 
     if (comm->channels[c].ring.userRanks != nullptr) {
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].ring.userRanks, comm->channels[c].ring.userRanks, nRanks, deviceStream), ret, fail);
+    }
+
+    // 1. Handle Halving Tables (Send/Recv)
+    if (comm->channels[c].bine.nSteps > 0 &&
+        comm->channels[c].bineSend != nullptr && comm->channels[c].devBineSend != nullptr &&
+        comm->channels[c].bineRecv != nullptr && comm->channels[c].devBineRecv != nullptr)
+    {
+      size_t halvingElems = (size_t)comm->channels[c].bine.nSteps * nRanks * nRanks;
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.send, comm->channels[c].bineSend, halvingElems, deviceStream), ret, fail);
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.recv, comm->channels[c].bineRecv, halvingElems, deviceStream), ret, fail);
+    }
+
+    // 2. Handle Doubling Table (Partners)
+    if (comm->channels[c].bine.nDoublingSteps > 0 &&
+        comm->channels[c].binePartner != nullptr && comm->channels[c].devBinePartner != nullptr)
+    {
+      size_t doublingElems = (size_t)comm->channels[c].bine.nDoublingSteps * nRanks;
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.partners, comm->channels[c].binePartner, doublingElems, deviceStream), ret, fail);
+    }
+
+    // 3. Handle Index and Order
+    if (nRanks > 0)
+    {
+      if (comm->channels[c].bineIndex != nullptr && comm->channels[c].devBineIndex != nullptr)
+      {
+        NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.index, comm->channels[c].bineIndex, nRanks, deviceStream), ret, fail);
+      }
+      if (comm->channels[c].bineOrder != nullptr && comm->channels[c].devBineOrder != nullptr)
+      {
+        NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.order, comm->channels[c].bineOrder, nRanks, deviceStream), ret, fail);
+      }
     }
   }
 
@@ -936,13 +982,18 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int rank = comm->rank;
   int nranks = comm->nRanks;
   int nNodes = 1;
+  int bineSteps = 0;
   ncclAffinity affinitySave = {};
   struct ncclTopoGraph* ringGraph = &comm->graphs[NCCL_ALGO_RING];
   struct ncclTopoGraph* treeGraph = &comm->graphs[NCCL_ALGO_TREE];
   struct ncclTopoGraph* collNetChainGraph = &comm->graphs[NCCL_ALGO_COLLNET_CHAIN];
   struct ncclTopoGraph* collNetDirectGraph = &comm->graphs[NCCL_ALGO_COLLNET_DIRECT];
   struct ncclTopoGraph* nvlsGraph = &comm->graphs[NCCL_ALGO_NVLS];
-  struct ncclTopoGraph* graphs[NCCL_NUM_ALGORITHMS] = { treeGraph, ringGraph, collNetDirectGraph, collNetChainGraph, nvlsGraph, nvlsGraph, treeGraph };
+  /** 
+   * INFO: [HLC] Added bine.
+   * FIXME: [HLC] Implement actual bine graph.
+   */
+  struct ncclTopoGraph* graphs[NCCL_NUM_ALGORITHMS] = { treeGraph, ringGraph, collNetDirectGraph, collNetChainGraph, nvlsGraph, nvlsGraph, treeGraph, ringGraph };
 
   struct graphInfo {
     int pattern;
@@ -1587,7 +1638,134 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   NCCLCHECKGOTO(ncclTopoTuneModel(comm, comm->minCompCap, comm->maxCompCap, graphs), ret, fail);
 
-  INFO(NCCL_INIT, "%d coll channels, %d collnet channels, %d nvls channels, %d p2p channels, %d p2p channels per peer", comm->nChannels, comm->nChannels, comm->nvlsChannels, comm->p2pnChannels, comm->p2pnChannelsPerPeer);
+  // INFO: Added Bine initialization.
+
+  if (comm->nRanks > 1 && (comm->nRanks & (comm->nRanks - 1)) == 0)
+  {
+    bineSteps = log2i(comm->nRanks);
+  }
+
+  if (bineSteps > 0)
+  {
+    // Precompute buffer element counts based on communicator topology.
+    // - halvingElems: per-rank send/recv tables across all steps (nRanks × nRanks × steps)
+    // - doublingElems: partner index table across all steps  (nRanks × steps)
+    // - mapElems:     per-rank index/order maps              (nRanks)
+    const size_t halvingElems  = (size_t)comm->nRanks * comm->nRanks * bineSteps;
+    const size_t doublingElems = (size_t)comm->nRanks * bineSteps;
+    const size_t mapElems      = (size_t)comm->nRanks;
+
+    // -------------------------------------------------------------------------
+    // Host-side allocations
+    // Each buffer is allocated once; if already present, we reuse and warn.
+    // -------------------------------------------------------------------------
+
+    if (comm->sharedBineSend == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineSend, halvingElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBineSend already allocated at %p — reusing existing buffer", comm->sharedBineSend);
+    }
+
+    if (comm->sharedBineRecv == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineRecv, halvingElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBineRecv already allocated at %p — reusing existing buffer", comm->sharedBineRecv);
+    }
+
+    if (comm->sharedBinePartner == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBinePartner, doublingElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBinePartner already allocated at %p — reusing existing buffer", comm->sharedBinePartner);
+    }
+
+    if (comm->sharedBineIndex == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineIndex, mapElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBineIndex already allocated at %p — reusing existing buffer", comm->sharedBineIndex);
+    }
+
+    if (comm->sharedBineOrder == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineOrder, mapElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBineOrder already allocated at %p — reusing existing buffer", comm->sharedBineOrder);
+    }
+
+    // -------------------------------------------------------------------------
+    // Device-side allocations (via cudaMalloc under the hood)
+    // Must run on the device set during commAlloc. Same idempotency policy as host.
+    // -------------------------------------------------------------------------
+
+    if (comm->sharedDevBineSend == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevBineSend, halvingElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevBineSend already allocated at %p — reusing existing device buffer", comm->sharedDevBineSend);
+    }
+
+    if (comm->sharedDevBineRecv == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevBineRecv, halvingElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevBineRecv already allocated at %p — reusing existing device buffer", comm->sharedDevBineRecv);
+    }
+
+    if (comm->sharedDevBinePartner == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevBinePartner, doublingElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevBinePartner already allocated at %p — reusing existing device buffer", comm->sharedDevBinePartner);
+    }
+
+    if (comm->sharedDevBineIndex == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevBineIndex, mapElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevBineIndex already allocated at %p — reusing existing device buffer", comm->sharedDevBineIndex);
+    }
+
+    if (comm->sharedDevBineOrder == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevBineOrder, mapElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevBineOrder already allocated at %p — reusing existing device buffer", comm->sharedDevBineOrder);
+    }
+  }
+
+  // Build Bine routing tables and establish peer transport connections.
+  // Note: Bine kernels require peer connectors to be fully initialized before first launch.
+  // comm->bandwidths must be populated by the tuning pass before this point to avoid
+  // spurious "no peer connections" warnings on power-of-two communicators.
+  NCCLCHECKGOTO(buildBineTables(comm), ret, fail);
+  NCCLCHECKGOTO(ncclTransportBineConnect(comm), ret, fail);
+
+  INFO(NCCL_INIT,
+     "%d coll channels, %d collnet channels, %d nvls channels, %d p2p channels, %d p2p channels per peer",
+     comm->nChannels, comm->nChannels, comm->nvlsChannels, comm->p2pnChannels, comm->p2pnChannelsPerPeer);
 
   if (comm->intraRank == 0) { // Load ncclParamLaunchMode
     const char* str = ncclGetEnv("NCCL_LAUNCH_MODE");

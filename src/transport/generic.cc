@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "transport.h"
 #include "bootstrap.h"
+#include <sstream>
 
 NCCL_PARAM(MultiSegmentRegister, "MULTI_SEGMENT_REGISTER", 1);
 
@@ -46,6 +47,7 @@ fail:
   goto exit;
 }
 
+// INFO: [HLC] bine tranport connect.
 ncclResult_t ncclTransportTreeConnect(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   if (comm && comm->nRanks > 1) {
@@ -85,4 +87,15 @@ exit:
   return ret;
 fail:
   goto exit;
+}
+
+// INFO: [HLC] Added bine connect.
+// FIXME: [HLC] Connect actual pairs.
+ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
+  for (int c = 0; c < comm->nChannels; c++) {
+    for (int r = 0; r < comm->nRanks; r++) {
+      NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &r, 1, &r, 0));
+    }
+  }
+  NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0));
 }
