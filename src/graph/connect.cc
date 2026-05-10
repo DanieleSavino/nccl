@@ -12,6 +12,11 @@
 #include "trees.h"
 #include "rings.h"
 #include "topo.h"
+#include "bine.h"
+#include "device/bine_utils.h"
+#include <vector>
+#include <sstream>
+#include <algorithm>
 
 /******************************************************************/
 /********************* Internode connection ***********************/
@@ -239,6 +244,230 @@ static ncclResult_t connectCollNet(struct ncclComm* comm, struct ncclTopoGraph* 
   return ncclSuccess;
 }
 
+// INFO: [HLC] Added Bine table construction.
+ncclResult_t buildBineTables(struct ncclComm *comm)
+{
+  const int nRanks = comm->nRanks;
+
+  // Bine requires a communicator size that is a power of two.
+  const bool bineSupported = is_power_of_two(nRanks); // && nRanks > 1;
+  const int  steps         = bineSupported ? log_2(nRanks) : 0;
+
+  // All five shared host buffers must be present for Bine to be usable.
+  const bool haveSharedBineBuffers =
+      comm->sharedBineSend    != nullptr &&
+      comm->sharedBineRecv    != nullptr &&
+      comm->sharedBinePartner != nullptr &&
+      comm->sharedBineIndex   != nullptr &&
+      comm->sharedBineOrder   != nullptr;
+
+  INFO(NCCL_GRAPH,
+       "Bine: rank=%d cudaDev=%d nRanks=%d nChannels=%d supported=%d steps=%d",
+       comm->rank, comm->cudaDev, nRanks, comm->nChannels, bineSupported, steps);
+
+  // -------------------------------------------------------------------------
+  // Guard: shared host buffers missing — disable Bine on all channels and bail.
+  // -------------------------------------------------------------------------
+  if (steps > 0 && !haveSharedBineBuffers)
+  {
+    INFO(NCCL_GRAPH,
+         "Bine: shared host buffers not allocated "
+         "(send=%p recv=%p partner=%p index=%p order=%p) — disabling Bine on all channels",
+         comm->sharedBineSend,
+         comm->sharedBineRecv,
+         comm->sharedBinePartner,
+         comm->sharedBineIndex,
+         comm->sharedBineOrder);
+
+    for (int c = 0; c < comm->nChannels; ++c)
+    {
+      comm->channels[c].bine.nSteps        = 0;
+      comm->channels[c].bine.nDoublingSteps = 0;
+      comm->channels[c].bine.send          = nullptr;
+      comm->channels[c].bine.recv          = nullptr;
+      comm->channels[c].bine.partners      = nullptr;
+      comm->channels[c].bine.index         = nullptr;
+      comm->channels[c].bine.order         = nullptr;
+    }
+    return ncclSuccess;
+  }
+
+  // -------------------------------------------------------------------------
+  // Publish step counts and buffer pointers to every channel.
+  // All channels share the same backing allocations; the schedule tables are
+  // indexed by rank and step, so sharing is safe.
+  // -------------------------------------------------------------------------
+  for (int c = 0; c < comm->nChannels; ++c)
+  {
+    comm->channels[c].bine.nSteps         = steps;
+    comm->channels[c].bine.nDoublingSteps = steps;
+
+    if (steps > 0)
+    {
+      // Device-side pointers (read directly by kernels).
+      comm->channels[c].bine.send     = comm->sharedDevBineSend;
+      comm->channels[c].bine.recv     = comm->sharedDevBineRecv;
+      comm->channels[c].bine.partners = comm->sharedDevBinePartner;
+      comm->channels[c].bine.index    = comm->sharedDevBineIndex;
+      comm->channels[c].bine.order    = comm->sharedDevBineOrder;
+
+      // Host-side mirrors (used for table construction and memcpy below).
+      comm->channels[c].bineSend    = comm->sharedBineSend;
+      comm->channels[c].bineRecv    = comm->sharedBineRecv;
+      comm->channels[c].binePartner = comm->sharedBinePartner;
+      comm->channels[c].bineIndex   = comm->sharedBineIndex;
+      comm->channels[c].bineOrder   = comm->sharedBineOrder;
+    }
+
+    INFO(NCCL_GRAPH,
+         "Bine: channel %d — "
+         "host(send=%p recv=%p partner=%p index=%p order=%p) "
+         "dev(send=%p recv=%p partner=%p index=%p order=%p)",
+         c,
+         comm->channels[c].bineSend,
+         comm->channels[c].bineRecv,
+         comm->channels[c].binePartner,
+         comm->channels[c].bineIndex,
+         comm->channels[c].bineOrder,
+         comm->channels[c].devBineSend,
+         comm->channels[c].devBineRecv,
+         comm->channels[c].devBinePartner,
+         comm->channels[c].devBineIndex,
+         comm->channels[c].devBineOrder);
+  }
+
+  // -------------------------------------------------------------------------
+  // Guard: Bine not applicable for this communicator — log reason and return.
+  // -------------------------------------------------------------------------
+  if (!bineSupported || steps == 0)
+  {
+    if (!is_power_of_two(nRanks))
+      INFO(NCCL_GRAPH, "Bine: disabled — communicator size %d is not a power of two", nRanks);
+    else if (nRanks <= 1)
+      INFO(NCCL_GRAPH, "Bine: disabled — communicator size %d must be greater than one", nRanks);
+    else
+      INFO(NCCL_GRAPH, "Bine: disabled — computed step count is %d", steps);
+
+    return ncclSuccess;
+  }
+
+  // -------------------------------------------------------------------------
+  // Guard: step count exceeds the compiled-in maximum.
+  // -------------------------------------------------------------------------
+  if (steps > NCCL_MAX_BINE_STEPS)
+  {
+    WARN("Bine: %d steps required but NCCL_MAX_BINE_STEPS=%d — aborting table build",
+         steps, NCCL_MAX_BINE_STEPS);
+    return ncclInternalError;
+  }
+
+  // -------------------------------------------------------------------------
+  // Allocate and populate the schedule tables.
+  //
+  // Halving tables (send/recv): indexed as [rank * nRanks + peerRank][step],
+  //   total size nRanks × nRanks × steps.
+  // Doubling tables (partner/index/order): indexed as [rank][step],
+  //   total size nRanks × steps (or nRanks for the per-rank maps).
+  // -------------------------------------------------------------------------
+  const size_t halvingTableElems  = (size_t)nRanks * nRanks * steps;
+  const size_t doublingTableElems = (size_t)nRanks * steps;
+
+  std::vector<int> sendTable(halvingTableElems,  -1);
+  std::vector<int> recvTable(halvingTableElems,  -1);
+  std::vector<int> partnerTable(doublingTableElems, -1);
+  std::vector<int> indexMap(nRanks, 0);
+  std::vector<int> orderMap(nRanks, 0);
+
+  // Fill the recursive-halving send/recv schedule.
+  ncclGetBineTreeDhlv(nRanks, steps,
+                      sendTable.data(),
+                      recvTable.data());
+
+  // Fill the recursive-doubling partner/index/order schedule.
+  ncclGetBineTreeDdbl(nRanks, steps,
+                      partnerTable.data(),
+                      indexMap.data(),
+                      orderMap.data());
+
+  // -------------------------------------------------------------------------
+  // Sanity check: every (rank, partner) pair at each step must differ in the
+  // bit corresponding to that step in their virtual index.  A matching bit
+  // indicates a malformed doubling schedule.
+  // WIP — remove or gate behind a debug flag before final push.
+  // -------------------------------------------------------------------------
+  for (int r = 0; r < nRanks; ++r)
+  {
+    const int myIdx = indexMap[r];
+
+    for (int s = 0; s < steps; ++s)
+    {
+      const int p = partnerTable[(size_t)r * steps + s];
+      if (p < 0)
+        continue;
+
+      const int pIdx  = indexMap[p];
+      const int bitMy = (myIdx >> s) & 1;
+      const int bitPar = (pIdx  >> s) & 1;
+
+      if (bitMy == bitPar)
+      {
+        fprintf(stderr,
+                "Bine: invalid doubling schedule — "
+                "rank %d (idx=%d) and partner %d (idx=%d) share the same bit at step %d\n",
+                r, myIdx, p, pIdx, s);
+        WARN("Bine: disabling due to invalid doubling schedule (rank=%d partner=%d step=%d)",
+             r, p, s);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Diagnostic: log the first few entries of each schedule row for this rank.
+  // -------------------------------------------------------------------------
+  auto logScheduleRow = [&](const char *label, const std::vector<int> &table,
+                             size_t offset, int width)
+  {
+    if (width <= 0)
+      return;
+
+    std::ostringstream oss;
+    const int printCount = std::min(width, 8);
+    oss << "Bine: " << label << " rank=" << comm->rank
+        << " (first " << printCount << " of " << width << "):";
+
+    for (int i = 0; i < printCount; ++i)
+      oss << " " << table[offset + i];
+
+    if (width > 8)
+      oss << " ...";
+
+    INFO(NCCL_GRAPH, "%s", oss.str().c_str());
+  };
+
+  const size_t myHalvingOffset  = (size_t)comm->rank * nRanks * steps; // row in the halving table
+  const size_t myDoublingOffset = (size_t)comm->rank * steps;           // row in the doubling table
+
+  logScheduleRow("send schedule",    sendTable,    myHalvingOffset,  steps);
+  logScheduleRow("recv schedule",    recvTable,    myHalvingOffset,  steps);
+  logScheduleRow("partner schedule", partnerTable, myDoublingOffset, steps);
+
+  // -------------------------------------------------------------------------
+  // Copy the completed host-side tables into the shared host buffers.
+  // The subsequent ncclTransportBineConnect call will upload them to device.
+  // -------------------------------------------------------------------------
+  memcpy(comm->sharedBineSend,    sendTable.data(),    halvingTableElems  * sizeof(int));
+  memcpy(comm->sharedBineRecv,    recvTable.data(),    halvingTableElems  * sizeof(int));
+  memcpy(comm->sharedBinePartner, partnerTable.data(), doublingTableElems * sizeof(int));
+  memcpy(comm->sharedBineIndex,   indexMap.data(),     nRanks             * sizeof(int));
+  memcpy(comm->sharedBineOrder,   orderMap.data(),     nRanks             * sizeof(int));
+
+  INFO(NCCL_GRAPH,
+       "Bine: schedule tables written to shared host buffers (rank=%d steps=%d)",
+       comm->rank, steps);
+
+  return ncclSuccess;
+}
+
 static ncclResult_t connectNvls(struct ncclComm* comm, int* nvlsHeads, int nHeads) {
   int headRank = -1;
   if (nHeads == 0) {
@@ -372,6 +601,7 @@ void exchangeValues(int* v0, int* v1) {
 
 NCCL_PARAM(UnpackDoubleNChannels, "UNPACK_DOUBLE_NCHANNELS", 1);
 
+// TODO: [HLC] Add bine channels here.
 ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePatterns, struct ncclTopoRanks** allTopoRanks, int* rings, struct ncclTopoGraph** graphs, struct ncclComm* parent) {
   // Gather data from all ranks
   ncclResult_t ret = ncclSuccess;

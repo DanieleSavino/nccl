@@ -1958,9 +1958,7 @@ static ncclResult_t topoGetAlgoInfo(
     }
   }
 
-  // XXX: [HLC] Bcast test.
-  // info->algorithm = algorithm;
-  info->algorithm = NCCL_ALGO_BINE;
+  info->algorithm = algorithm;
   info->protocol = protocol;
   float time = minTime;
 

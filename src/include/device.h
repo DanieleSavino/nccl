@@ -193,6 +193,18 @@ struct ncclTree {
   int down[NCCL_MAX_TREE_ARITY];
 };
 
+// INFO: [HLC] Added bine struct.
+#define NCCL_MAX_BINE_STEPS 20
+struct ncclBine {
+  int nSteps;
+  int nDoublingSteps;
+  int* send;
+  int* recv;
+  int* partners;
+  int* index;
+  int* order;
+};
+
 #define NCCL_MAX_DIRECT_ARITY 7
 struct ncclDirect {
   int depth;
@@ -418,6 +430,8 @@ struct alignas(16) ncclDevChannel {
   struct ncclDevChannelPeer** peers;
   struct ncclRing ring;
   struct ncclTree tree;
+  // INFO: [HLC] bine channel.
+  struct ncclBine bine;
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
   struct ncclNvls nvls;
@@ -646,7 +660,7 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                  algo == NCCL_ALGO_PAT ? 3;
+                  /** algo == NCCL_ALGO_PAT ? */ 3;
       row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }

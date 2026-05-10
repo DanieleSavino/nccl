@@ -38,6 +38,9 @@ ncclResult_t ncclTopoPathAllDirectNVLink(struct ncclTopoSystem* system, bool* al
 ncclResult_t ncclCheckMultiRank(struct ncclComm* comm);
 ncclResult_t ncclTopoComputeCommCPU(struct ncclComm* comm);
 
+// INFO: [HLC] Added bine table builder.
+ncclResult_t buildBineTables(struct ncclComm *comm);
+
 // Query topology
 ncclResult_t ncclTopoGetNetDev(struct ncclComm* comm, int rank, struct ncclTopoGraph* graph, int channelId, int peerRank, int64_t* id, int* dev, int* proxyRank);
 ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2, int* p2p, int *read, int* intermediateRank, int* cudaP2p);

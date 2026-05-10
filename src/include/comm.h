@@ -156,6 +156,19 @@ struct ncclChannel {
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
 
+  // INFO: [HLC] Added bine channels.
+  int* bineSend;
+  int* bineRecv;
+  int* devBineSend;
+  int* devBineRecv;
+  int* binePartner;
+  int* bineIndex;
+  int* bineOrder;
+  int* devBinePartner;
+  int* devBineIndex;
+  int* devBineOrder;
+  struct ncclBine bine;
+
   struct ncclNvls nvls;
 
   int id; // index of this channel
@@ -538,6 +551,18 @@ struct ncclComm {
   struct ncclIntruQueue<struct ncclCommCallback, &ncclCommCallback::next> legacyRegCleanupQueue;
   bool peerInfoValid;
   float minNetBw;
+
+  // INFO: [HLC] Added bine comms.
+  int* sharedBineSend;
+  int* sharedBineRecv;
+  int* sharedBinePartner;
+  int* sharedBineIndex;
+  int* sharedBineOrder;
+  int* sharedDevBineSend;
+  int* sharedDevBineRecv;
+  int* sharedDevBinePartner;
+  int* sharedDevBineIndex;
+  int* sharedDevBineOrder;
 
   ncclNet_t* ncclNet;
   void* netContext;

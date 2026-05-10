@@ -190,13 +190,7 @@ static ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConn
          * but might want to switch to a proper bine one once graph is complete.
          */
         case NCCL_ALGO_BINE: {
-          fprintf(stderr, "Using BINE\n");
-          for (int c = 0; c < comm->nChannels; c++) {
-              for (int r = 0; r < comm->nRanks; r++) {
-              NCCLCHECK(ncclTransportP2pConnect(comm, c, 1, &r, 1, &r, 0));
-            }
-          }
-          NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_BINE], 0));
+          NCCLCHECK(ncclTransportBineConnect(comm));
           break;
         }
 

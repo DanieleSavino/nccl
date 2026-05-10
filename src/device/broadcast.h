@@ -99,78 +99,108 @@ __device__ __forceinline__ int bine_nb2rank(int nb, int s) {
   return val & (size - 1);
 }
 
-// INFO: [HLC] Added bine bcast
+// INFO:  [HLC] Added Bine broadcast implementation.
 template <typename T, typename RedOp, typename Proto>
-__device__ __forceinline__ void runBine(int tid, int nthreads,
-                                        struct ncclDevWorkColl *work) {
-  const int rank = ncclShmem.comm.rank;
-  const int nranks = ncclShmem.comm.nRanks;
-  const int root = work->root;
-  const int s = __log2f(nranks);
+__device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work)
+{
+  ncclBine *bine = &ncclShmem.channel.bine;
 
-  ssize_t chunkCount, channelCount, gridOffset;
+  // If the Bine channel is not properly initialized, fall back to the ring algorithm.
+  if (bine->nSteps == 0 || bine->send == nullptr || bine->recv == nullptr)
+  {
+    runRing<T, RedOp, Proto>(tid, nthreads, work);
+    return;
+  }
+
+  const int nSteps = bine->nSteps;
+  const int rank   = ncclShmem.comm.rank;
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int root   = work->root;
+
+  // Determine whether zero-copy (direct) paths are available for this operation.
+  const bool canDirectRecv = (work->direct & NCCL_P2P_READ)  != 0;
+  const bool canDirectSend = (work->direct & NCCL_P2P_WRITE) != 0;
+
+  ssize_t chunkCount;
+  ssize_t channelCount;
+  ssize_t gridOffset;
   ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                   (ssize_t *)nullptr, &gridOffset, &channelCount, &chunkCount);
 
-  T *inputBuf = (T *)work->sendbuff;
-  T *outputBuf = (T *)work->recvbuff;
+  size_t offset;
+  int    nelem;
 
-  // Root copies inputBuf -> outputBuf if they differ
-  if (rank == root && inputBuf != outputBuf) {
-    for (ssize_t i = tid; i < channelCount; i += nthreads)
-      outputBuf[gridOffset + i] = inputBuf[gridOffset + i];
-    __syncthreads();
+  // The root broadcasts from sendbuff; all other ranks work in-place on recvbuff.
+  const T *sendBuff = (rank == root) ? (const T *)work->sendbuff
+                                     : (const T *)work->recvbuff;
+  T *recvBuff = (T *)work->recvbuff;
+
+  // Base index into the Bine send/recv tables for the (root, rank) pair.
+  // Table layout: [root * nRanks + rank][step].
+  const size_t rootOffset = ((size_t)root * nRanks + rank) * nSteps;
+
+  for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount)
+  {
+    offset = gridOffset + elemOffset;
+    nelem  = min(chunkCount, channelCount - elemOffset);
+
+    for (int step = 0; step < nSteps; ++step)
+    {
+      int stepIdx  = rootOffset + step;
+      int sendPeer = bine->send[stepIdx];
+      int recvPeer = bine->recv[stepIdx];
+
+      // A step with no active peer on either side can be skipped entirely.
+      if (sendPeer == -1 && recvPeer == -1)
+        continue;
+
+      // Each step is strictly one-directional: exactly one of send/recv is active.
+      assert(sendPeer == -1 || recvPeer == -1);
+
+      int recvPeers[1] = {recvPeer};
+      int sendPeers[1] = {sendPeer};
+
+      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0>
+          prims(tid, nthreads, recvPeers, sendPeers, sendBuff, recvBuff, work->redOpArg);
+
+      if (recvPeer != -1)
+      {
+        // Receive step: pull data from the upstream peer.
+        if (canDirectRecv)
+          prims.directRecv(offset, nelem);
+        else
+          prims.recv(offset, nelem);
+      }
+      else if (sendPeer != -1)
+      {
+        // Send step: push data to the downstream peer.
+        if (canDirectSend)
+        {
+          // If root's sendbuff and recvbuff are aliased, send directly without an
+          // intermediate copy; otherwise copy from sendbuff into recvbuff while sending.
+          if (rank == root && work->sendbuff == work->recvbuff)
+            prims.directSend(offset, offset, nelem);
+          else
+            prims.directCopySend(offset, offset, nelem);
+        }
+        else
+        {
+          // No direct path available — route through the intermediate staging buffer.
+          prims.send(offset, nelem);
+        }
+      }
+    }
   }
 
-  int mod_rank = (rank - root + nranks) % nranks;
-  int nb_rank = bine_rank2nb(mod_rank, s);
-  int recvd = (rank == root) ? 1 : 0;
-
-  if (tid == 0) printf("[BINE bcast] rank=%d nranks=%d root=%d\n", rank, nranks, root);
-
-  // FIXME: [HLC] Create an actual bine communicator
-  int mask = 1 << (s - 1);
-  while (mask > 0) {
-    int mask_lsbs = (mask << 1) - 1;
-    int nb_peer = nb_rank ^ mask_lsbs;
-    int mod_peer = bine_nb2rank(nb_peer, s);
-    int peer = (mod_peer + root) % nranks;
-
-    int do_send = 0, do_recv = 0;
-    if (recvd) {
-      do_send = 1;
-    } else {
-      int eq_lsbs = nb_rank & mask_lsbs;
-      if (eq_lsbs == 0 || eq_lsbs == mask_lsbs) {
-        do_recv = 1;
-      }
-    }
-
-    if (do_send) {
-      // Always send from outputBuf: root copied there above, non-root received there
-      Primitives<T, RedOp, FanAsymmetric<0, 1>, 1, Proto, 0> prims(
-          tid, nthreads, nullptr, &peer, outputBuf, outputBuf,
-          work->redOpArg, 0, 0, 0, work);
-      for (ssize_t elemOffset = 0; elemOffset < channelCount;
-           elemOffset += chunkCount) {
-        ssize_t offset = gridOffset + elemOffset;
-        int nelem = (int)min(chunkCount, channelCount - elemOffset);
-        prims.send(offset, nelem);
-      }
-    } else if (do_recv) {
-      Primitives<T, RedOp, FanAsymmetric<1, 0>, 1, Proto, 0> prims(
-          tid, nthreads, &peer, nullptr, inputBuf, outputBuf,
-          work->redOpArg, 0, 0, 0, work);
-      for (ssize_t elemOffset = 0; elemOffset < channelCount;
-           elemOffset += chunkCount) {
-        ssize_t offset = gridOffset + elemOffset;
-        int nelem = (int)min(chunkCount, channelCount - elemOffset);
-        prims.recv(offset, nelem);
-      }
-      recvd = 1;
-    }
-
-    mask >>= 1;
+  // After the Bine steps, the root must copy its own data from sendbuff into recvbuff
+  // so that its output is consistent with every other rank's recvbuff.
+  if (rank == root && work->sendbuff != work->recvbuff)
+  {
+    T *src = (T *)work->sendbuff + gridOffset;
+    T *dst = (T *)work->recvbuff + gridOffset;
+    reduceCopy<COLL_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs=*/0>(
+        tid, nthreads, work->redOpArg, false, 1,
+        (void **)&src, 1, (void **)&dst, channelCount);
   }
 }
 
