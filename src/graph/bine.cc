@@ -569,7 +569,7 @@ void ncclGetBineTreeDdbl(int nRanks, int steps, int *partners, int *index, int *
   for (int r = 0; r < nRanks; ++r)
   {
     const int idxVal = v_representation[r]; // in [0, 2^steps)
-    index[idxVal] = r;
+    index[r] = idxVal;
     order[idxVal] = r;
   }
 
