@@ -250,8 +250,8 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   const int nRanks = comm->nRanks;
 
   // Bine requires a communicator size that is a power of two.
-  const bool bineSupported = is_power_of_two(nRanks); // && nRanks > 1;
-  const int  steps         = bineSupported ? log_2(nRanks) : 0;
+  const bool bineSupported = is_pow_2(nRanks); // && nRanks > 1;
+  const int  steps         = bineSupported ? ceil_log_2(nRanks) : 0;
 
   // All five shared host buffers must be present for Bine to be usable.
   const bool haveSharedBineBuffers =
@@ -341,7 +341,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   // -------------------------------------------------------------------------
   if (!bineSupported || steps == 0)
   {
-    if (!is_power_of_two(nRanks))
+    if (!is_pow_2(nRanks))
       INFO(NCCL_GRAPH, "Bine: disabled — communicator size %d is not a power of two", nRanks);
     else if (nRanks <= 1)
       INFO(NCCL_GRAPH, "Bine: disabled — communicator size %d must be greater than one", nRanks);
@@ -384,42 +384,10 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
                       recvTable.data());
 
   // Fill the recursive-doubling partner/index/order schedule.
-  ncclGetBineTreeDdbl(nRanks, steps,
+  ncclGetBineButterflyDdbl(nRanks, steps,
                       partnerTable.data(),
                       indexMap.data(),
                       orderMap.data());
-
-  // -------------------------------------------------------------------------
-  // Sanity check: every (rank, partner) pair at each step must differ in the
-  // bit corresponding to that step in their virtual index.  A matching bit
-  // indicates a malformed doubling schedule.
-  // WIP — remove or gate behind a debug flag before final push.
-  // -------------------------------------------------------------------------
-  for (int r = 0; r < nRanks; ++r)
-  {
-    const int myIdx = indexMap[r];
-
-    for (int s = 0; s < steps; ++s)
-    {
-      const int p = partnerTable[(size_t)r * steps + s];
-      if (p < 0)
-        continue;
-
-      const int pIdx  = indexMap[p];
-      const int bitMy = (myIdx >> s) & 1;
-      const int bitPar = (pIdx  >> s) & 1;
-
-      if (bitMy == bitPar)
-      {
-        fprintf(stderr,
-                "Bine: invalid doubling schedule — "
-                "rank %d (idx=%d) and partner %d (idx=%d) share the same bit at step %d\n",
-                r, myIdx, p, pIdx, s);
-        WARN("Bine: disabling due to invalid doubling schedule (rank=%d partner=%d step=%d)",
-             r, p, s);
-      }
-    }
-  }
 
   // -------------------------------------------------------------------------
   // Diagnostic: log the first few entries of each schedule row for this rank.
