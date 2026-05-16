@@ -614,7 +614,7 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     if (coll == ncclFuncSendRecv) break;
     row += 1;
 
-    int nAlgos = 4;
+    int nAlgos = 5;
     if (coll == ncclFuncAllGather) {
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
