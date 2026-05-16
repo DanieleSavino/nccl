@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "transport.h"
 #include "bootstrap.h"
+#include <nccl.h>
 #include <sstream>
 
 NCCL_PARAM(MultiSegmentRegister, "MULTI_SEGMENT_REGISTER", 1);
@@ -98,4 +99,6 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     }
   }
   NCCLCHECK(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0));
+
+  return ncclSuccess;
 }

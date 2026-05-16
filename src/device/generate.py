@@ -84,7 +84,7 @@ else:
 
 # INFO: [HLC] Added bine.
 algos_of_coll = {
-  "AllGather":     ["RING","COLLNET_DIRECT","NVLS","PAT"],
+  "AllGather":     ["RING","COLLNET_DIRECT","NVLS","PAT", "BINE"],
   "AllGatherV":    ["RING"],
   "AllReduce":     ["TREE","RING","COLLNET_DIRECT","COLLNET_CHAIN","NVLS","NVLS_TREE"],
   "Broadcast":     ["RING", "BINE"],
