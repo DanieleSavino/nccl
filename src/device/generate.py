@@ -88,7 +88,7 @@ algos_of_coll = {
   "AllGatherV":    ["RING"],
   "AllReduce":     ["TREE","RING","COLLNET_DIRECT","COLLNET_CHAIN","NVLS","NVLS_TREE"],
   "Broadcast":     ["RING", "BINE"],
-  "Reduce":        ["RING"],
+  "Reduce":        ["RING", "BINE"],
   "ReduceScatter": ["RING","COLLNET_DIRECT","NVLS","PAT"],
   "SendRecv":      [None]
 }

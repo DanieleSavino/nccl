@@ -649,9 +649,11 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 1;
+    nAlgos = 2;
     if (coll == ncclFuncReduce) {
-      row += (devRedOp*NumTypes + type)*NCCL_NUM_PROTOCOLS + proto;
+      int algo1 = algo == NCCL_ALGO_RING ? 0 :
+                  /** algo == NCCL_ALGO_BINE ? */ 1;
+      row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;

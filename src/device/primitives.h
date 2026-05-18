@@ -138,6 +138,11 @@ struct PrimitivesWithoutDirect {
   __device__ __forceinline__ void directRecvReduceCopyDirectSend(intptr_t inpIx, intptr_t outIx, ssize_t eltN, bool postOp=false) {
     static_cast<RealPrimitives*>(this)->recvReduceCopySend(inpIx, outIx, eltN, postOp);
   }
+
+  // INFO: [HLC]: Added fallback for directRecvReduceCopy (used in reduce).
+  __device__ __forceinline__ void directRecvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
+    static_cast<RealPrimitives*>(this)->recvReduceCopy(inpIx, outIx, eltN, postOp);
+  }
 };
 
 __device__ inline int checkAbort(int &abortCache, const int abortValue, int &spins) {
