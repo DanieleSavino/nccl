@@ -9,6 +9,7 @@
 #include "param.h"
 #include "gdrwrap.h"
 #include "transport.h"
+#include "device/bine_utils.h"
 
 ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   struct ncclChannel* channel = &comm->channels[channelId];
@@ -57,6 +58,61 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   channel->ring.rankToIndex = ncclMemoryStackAlloc<int>(&comm->memPermanent, nRanks);
   NCCLCHECK(ncclCudaCallocAsync(&channel->devRingUserRanks, nRanks, deviceStream, comm->memManager, ncclMemOffload));
   ncclCommPushCudaFree(comm, channel->devRingUserRanks);
+
+  // INFO: [HLC] Added Bine init.
+  bool bineSupported = is_pow_2(nRanks) && nRanks > 1;
+  int bineSteps = bineSupported ? ceil_log_2(nRanks) : 0;
+  channel->bine.nSteps = bineSteps;
+  channel->bine.nDoublingSteps = bineSteps;
+  channel->bine.send = nullptr;
+  channel->bine.recv = nullptr;
+  channel->bine.partners = nullptr;
+  channel->bine.index = nullptr;
+  channel->bine.order = nullptr;
+  channel->bineSend = nullptr;
+  channel->bineRecv = nullptr;
+  channel->binePartner = nullptr;
+  channel->bineIndex = nullptr;
+  channel->bineOrder = nullptr;
+  channel->devBineSend = nullptr;
+  channel->devBineRecv = nullptr;
+  channel->devBinePartner = nullptr;
+  channel->devBineIndex = nullptr;
+  channel->devBineOrder = nullptr;
+  if (bineSteps > 0) {
+    size_t halvingElems = (size_t)nRanks * nRanks * bineSteps;
+    size_t doublingElems = (size_t)nRanks * bineSteps;
+    if (comm->sharedBineSend == nullptr) {
+      comm->sharedBineSend = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingElems);
+      comm->sharedBineRecv = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingElems);
+      comm->sharedBinePartner = ncclMemoryStackAlloc<int>(&comm->memPermanent, doublingElems);
+      comm->sharedBineIndex = ncclMemoryStackAlloc<int>(&comm->memPermanent, nRanks);
+      comm->sharedBineOrder = ncclMemoryStackAlloc<int>(&comm->memPermanent, nRanks);
+    }
+    channel->bineSend = comm->sharedBineSend;
+    channel->bineRecv = comm->sharedBineRecv;
+    channel->binePartner = comm->sharedBinePartner;
+    channel->bineIndex = comm->sharedBineIndex;
+    channel->bineOrder = comm->sharedBineOrder;
+
+    if (comm->sharedDevBineSend == nullptr) {
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineSend,    halvingElems,  deviceStream, comm->memManager, ncclMemOffload));
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineRecv,    halvingElems,  deviceStream, comm->memManager, ncclMemOffload));
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBinePartner, doublingElems, deviceStream, comm->memManager, ncclMemOffload));
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineIndex,   nRanks,        deviceStream, comm->memManager, ncclMemOffload));
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineOrder,   nRanks,        deviceStream, comm->memManager, ncclMemOffload));
+      ncclCommPushCudaFree(comm, comm->sharedDevBineSend);
+      ncclCommPushCudaFree(comm, comm->sharedDevBineRecv);
+      ncclCommPushCudaFree(comm, comm->sharedDevBinePartner);
+      ncclCommPushCudaFree(comm, comm->sharedDevBineIndex);
+      ncclCommPushCudaFree(comm, comm->sharedDevBineOrder);
+    }
+    channel->devBineSend = comm->sharedDevBineSend;
+    channel->devBineRecv = comm->sharedDevBineRecv;
+    channel->devBinePartner = comm->sharedDevBinePartner;
+    channel->devBineIndex = comm->sharedDevBineIndex;
+    channel->devBineOrder = comm->sharedDevBineOrder;
+  }
 
   /* guarantee addr has been copied into channel->devPeers */
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
