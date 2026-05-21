@@ -993,7 +993,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
    * INFO: [HLC] Added bine.
    * FIXME: [HLC] Implement actual bine graph.
    */
-  struct ncclTopoGraph* graphs[NCCL_NUM_ALGORITHMS] = { treeGraph, ringGraph, collNetDirectGraph, collNetChainGraph, nvlsGraph, nvlsGraph, treeGraph, ringGraph };
+  struct ncclTopoGraph* graphs[NCCL_NUM_ALGORITHMS] = { treeGraph, ringGraph, collNetDirectGraph, collNetChainGraph, nvlsGraph, nvlsGraph, treeGraph, treeGraph };
 
   struct graphInfo {
     int pattern;

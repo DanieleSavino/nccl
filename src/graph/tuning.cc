@@ -140,33 +140,38 @@ static const float nvlsEfficiency[NCCL_NUM_COMPCAPS] = {
 };
 
 // Default tuner constants (positional initializers for C++17 compatibility)
+// FIXME: [HLC] Tmp values copied from tree.
 static const ncclTunerConstants_t ncclTunerConstantsDefaults = {
   // baseLatencies
   {
     {  6.8, 14.0,  8.4 }, {  6.6, 14.0,  8.4 },  // Tree, Ring
     {    0,    0,    0 }, {    0,    0,    0 },  // Collnet Direct, Chain
     {    0,    0,    0 }, {    0,    0,    0 },  // NVLS, NVLS Tree
-    {  8.0,  8.0,  8.0 }                         // PAT
+    {  8.0,  8.0,  8.0 },                        // PAT
+    {  6.8, 14.0,  8.4 }                         // INFO: BINE - same as Tree.
   },
   // hwLatencies
   {
   /* NVLINK */
-  { { 0.6, 1.25, 4.0 }, { 0.6, 1.9, 3.4 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
-    {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
-    {  0,    0,  25 }, {  0,   0,  25 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
-    },
+  { { 0.6, 1.25, 4.0 }, { 0.6, 1.9, 3.4 },
+    {  0,    0, 3.7 }, {  0,   0,  2.8 },
+    {  0,    0,  25 }, {  0,   0,  25 },
+    {  0,    0, 4.0 },  /* PAT */
+    { 0.6, 1.25, 4.0 }  /* INFO: BINE - same as Tree */
+  },
   /* PCI */
   { { 1.0, 1.9, 4.0 }, { 1.0, 2.5, 5.7 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {  0,    0,   0 }, {  0,   0,    0 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
+    {  0,    0, 4.0 }, /* PAT (LL/LL128/Simple)*/
+    { 1.0, 1.9, 4.0 }  /* INFO: BINE - same as Tree */
     },
   /* NET */
   { { 5.0, 8.5, 14 }, { 2.7, 4.0, 14.0 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {   0,   0, 31 }, {   0,   0,   30 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {   0,   0, 18 }, {   0,   0,   20.9 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {   0,   0, 14 } /* PAT (LL/LL128/Simple)*/
+    {   0,   0, 14 }, /* PAT (LL/LL128/Simple)*/
+    { 1.0, 1.9, 4.0 }  /* INFO: BINE - same as Tree */
     },
   },
   // llMaxBws

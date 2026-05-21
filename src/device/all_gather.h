@@ -90,12 +90,6 @@ namespace {
     ncclBine *bine = &ncclShmem.channel.bine;
     const int steps = bine->nDoublingSteps;
 
-    if (steps == 0 || !bine->partners || !bine->index || !bine->order)
-    {
-      runRing<T, RedOp, Proto>(tid, nthreads, work);
-      return;
-    }
-
     ssize_t count, gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                     &count, &gridOffset, &channelCount, &chunkCount);

@@ -105,13 +105,6 @@ __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *
 {
   ncclBine *bine = &ncclShmem.channel.bine;
 
-  // If the Bine channel is not properly initialized, fall back to the ring algorithm.
-  if (bine->nSteps == 0 || bine->send == nullptr || bine->recv == nullptr)
-  {
-    runRing<T, RedOp, Proto>(tid, nthreads, work);
-    return;
-  }
-
   const int nSteps = bine->nSteps;
   const int rank   = ncclShmem.comm.rank;
   const int nRanks = ncclShmem.comm.nRanks;

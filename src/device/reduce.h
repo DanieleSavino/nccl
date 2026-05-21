@@ -58,15 +58,6 @@ namespace {
   {
     ncclBine *bine = &ncclShmem.channel.bine;
 
-    if (bine->nSteps == 0 || bine->send == nullptr || bine->recv == nullptr) {
-        if (tid == 0)
-            printf("[rank %d ch %d] BINE reduce fallback: nSteps=%d send=%p recv=%p\n",
-                  ncclShmem.comm.rank, ncclShmem.channelId,
-                  bine->nSteps, bine->send, bine->recv);
-        runRing<T, RedOp, Proto>(tid, nthreads, work);
-        return;
-    }
-
     ssize_t gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                     (ssize_t *)nullptr, &gridOffset, &channelCount, &chunkCount);
