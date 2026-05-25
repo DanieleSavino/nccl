@@ -658,12 +658,13 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 4;
+    nAlgos = 5;
     if (coll == ncclFuncReduceScatter) {
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                  /** algo == NCCL_ALGO_PAT ? */ 3;
+                  algo == NCCL_ALGO_PAT ? 3 :
+                  /** algo == NCCL_ALGO_BINE ? */ 4;
       row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
