@@ -75,6 +75,8 @@ namespace {
 
     const size_t rootOffset = ((size_t)root * nRanks + rank) * bine->nSteps;
 
+    __syncthreads();
+
     for (int step = bine->nSteps - 1; step >= 0; --step)
     {
       const int stepIdx = rootOffset + step;
@@ -151,16 +153,6 @@ namespace {
 
       if (sendPeer >= 0)
       {
-        if (isRoot)
-        {
-          if (tid == 0)
-          {
-            printf("Bine reduce schedule invalid: root rank %d has a send at step %d\n", rank, step);
-          }
-          runRing<T, RedOp, Proto>(tid, nthreads, work);
-          return;
-        }
-
         int sendPeers[1] = {sendPeer};
 
         if (useDirect)

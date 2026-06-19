@@ -107,6 +107,8 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op) {
   bool needed = true;
   NCCLCHECK(ncclProxySaveOp(comm, op, &needed));
+  INFO(NCCL_INIT, "ncclAddProxyOpIfNeeded: algo=%d pattern=%d needed=%d connection=%p",
+       op->task.coll ? op->task.coll->algorithm : -1, op->pattern, needed, op->connection);
   if (needed) {
     struct ncclProxyOp* q = ncclMemoryPoolAlloc<struct ncclProxyOp>(&comm->memPool_ncclProxyOp, &comm->memPermanent);
     *q = *op; // C++ struct assignment
@@ -2103,18 +2105,49 @@ static ncclResult_t calcCollChunking(
   ncclPattern_t pattern;
   size_t grainSize = ncclProtoGrainSize(info->protocol);
 
+  auto computeBineStages = [&]() {
+    const int halvingSteps = comm->channels[0].bine.nSteps;
+    const int doublingSteps = comm->channels[0].bine.nDoublingSteps;
+    switch (info->func)
+    {
+    case ncclFuncReduce:
+    case ncclFuncBroadcast:
+      return halvingSteps;
+    case ncclFuncReduceScatter:
+    case ncclFuncAllGather:
+      return doublingSteps;
+    case ncclFuncAllReduce:
+      return halvingSteps + doublingSteps;
+    default:
+      return std::max(halvingSteps, doublingSteps);
+    }
+  };
+
+  const int bineStages = info->algorithm == NCCL_ALGO_BINE ? computeBineStages() : 0;
+
+  auto computeChunksPerChannel = [&](int size) -> int {
+    return size > 0 ? (int)DIVUP(nBytes, (size_t)nChannels * (size_t)size) : 0;
+  };
+
+  int bineChunksPerLoop = 1;
+
   switch (info->func) {
   case ncclFuncBroadcast:
-    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeDown : ncclPatternPipelineFrom;
+    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeDown :
+              info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
+              ncclPatternPipelineFrom;
     break;
   case ncclFuncReduce:
-    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUp : ncclPatternPipelineTo;
+    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUp :
+              info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
+              ncclPatternPipelineTo;
     break;
   case ncclFuncReduceScatter:
     pattern =
       info->algorithm == NCCL_ALGO_PAT ? ncclPatternPatUp :
       info->algorithm == NCCL_ALGO_NVLS ? ncclPatternNvls :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       ncclPatternRing;
     break;
   case ncclFuncAllGather:
@@ -2122,6 +2155,7 @@ static ncclResult_t calcCollChunking(
       info->algorithm == NCCL_ALGO_PAT ? ncclPatternPatDown :
       info->algorithm == NCCL_ALGO_NVLS ? ncclPatternNvls :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       ncclPatternRing;
     break;
   case ncclFuncAllReduce:
@@ -2131,6 +2165,7 @@ static ncclResult_t calcCollChunking(
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
       info->algorithm == NCCL_ALGO_COLLNET_CHAIN ? ncclPatternCollnetChain :
       info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUpDown :
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       ncclPatternRingTwice;
     break;
   default:
@@ -2194,6 +2229,18 @@ static ncclResult_t calcCollChunking(
     while (nBytes / (nChannels*chunkSize) < nstepsLL128*64/ppn && chunkSize > 131072) chunkSize /= 2;
     // coverity[integer_division]
     while (nBytes / (nChannels*chunkSize) < nstepsLL128*16/ppn && chunkSize > 32768) chunkSize /= 2;
+  } else if (info->algorithm == NCCL_ALGO_BINE) {
+    const int safeMinChunkSize = 32768;
+    const int desiredChunksPerChannel = bineStages > 0 ? bineStages : 1;
+    int availableChunksPerChannel = computeChunksPerChannel(chunkSize);
+    while (desiredChunksPerChannel > 0 && availableChunksPerChannel < desiredChunksPerChannel && chunkSize > safeMinChunkSize)
+    {
+      chunkSize /= 2;
+      availableChunksPerChannel = computeChunksPerChannel(chunkSize);
+    }
+    bineChunksPerLoop = std::max(availableChunksPerChannel, 1);
+    if (desiredChunksPerChannel > 0)
+      bineChunksPerLoop = std::min(bineChunksPerLoop, desiredChunksPerChannel);
   } else if (info->func == ncclFuncAllGather && info->algorithm == NCCL_ALGO_PAT) {
     while (chunkSize*nChannels*32 > nBytes && chunkSize > 65536) chunkSize /= 2;
   } else if (info->func == ncclFuncReduceScatter && info->algorithm == NCCL_ALGO_PAT) {
@@ -2248,6 +2295,10 @@ static ncclResult_t calcCollChunking(
     break;
   case ncclPatternNvlsTree:
     nstepsPerLoop = 1; nchunksPerLoop = comm->channels[0].nvls.nHeads;
+    break;
+  case ncclPatternBine:
+    nstepsPerLoop = bineStages > 0 ? bineStages : 1;
+    nchunksPerLoop = bineChunksPerLoop;
     break;
   default:
     WARN("Unknown pattern %d", pattern);
@@ -2315,7 +2366,11 @@ static ncclResult_t calcCollChunking(
         proxyOp->nsteps = DIVUP(nBytes, proxyOp->loopSize) * nstepsPerLoop;
         proxyOp->loopOffset = 0;
       }
-    } else {
+    }
+    else if (info->algorithm == NCCL_ALGO_BINE) {
+      // Skip
+    }
+    else {
       WARN("Net registration invalid algorithm %s", ncclAlgoToString(info->algorithm));
       return ncclInternalError;
     }
@@ -2361,6 +2416,80 @@ static ncclResult_t calcCollChunking(
   case ncclPatternProfiler:
     // Peer count hints unused
     break;
+  case ncclPatternBine:
+  {
+    std::vector<int> sendPeers;
+    std::vector<int> recvPeers;
+
+    struct ncclChannel *channel = &comm->channels[0];
+
+    const int steps = channel->bine.nSteps;
+    const int doublingSteps = channel->bine.nDoublingSteps;
+
+    const bool hasHalving = steps > 0 && channel->bineSend != nullptr && channel->bineRecv != nullptr;
+    const bool hasDoubling = doublingSteps > 0 && channel->binePartner != nullptr;
+
+    const int nRanks = comm->nRanks;
+    const int rank = comm->rank;
+
+    if (hasHalving && nRanks > 0)
+    {
+      const bool rootScoped = proxyOp->coll == ncclFuncBroadcast || proxyOp->coll == ncclFuncReduce;
+      const int rootCount = rootScoped ? 1 : nRanks;
+
+      for (int rIndex = 0; rIndex < rootCount; ++rIndex)
+      {
+        int root = (rootCount == 1) ? proxyOp->root : rIndex;
+        if (root < 0 || root >= nRanks)
+          continue;
+
+        for (int step = 0; step < steps; ++step)
+        {
+          size_t stepIdx = ((size_t)root * nRanks + rank) * steps + step;
+          int sendPeer = channel->bineSend[stepIdx];
+          int recvPeer = channel->bineRecv[stepIdx];
+
+          if (sendPeer >= 0 && sendPeer != rank)
+            sendPeers.push_back(sendPeer);
+          if (recvPeer >= 0 && recvPeer != rank)
+            recvPeers.push_back(recvPeer);
+        }
+      }
+    }
+
+    const bool includeDoublingStage =
+        proxyOp->coll == ncclFuncAllReduce ||
+        proxyOp->coll == ncclFuncAllGather ||
+        proxyOp->coll == ncclFuncReduceScatter;
+
+    if (hasDoubling && includeDoublingStage && nRanks > 0)
+    {
+      for (int step = 0; step < doublingSteps; ++step)
+      {
+        int partner = channel->binePartner[rank * doublingSteps + step];
+
+        if (partner >= 0 && partner != rank)
+        {
+          sendPeers.push_back(partner);
+          recvPeers.push_back(partner);
+        }
+      }
+    }
+
+    auto dedup = [](std::vector<int> &peers)
+    {
+      std::sort(peers.begin(), peers.end());
+      peers.erase(std::unique(peers.begin(), peers.end()), peers.end());
+    };
+
+    dedup(sendPeers);
+    dedup(recvPeers);
+
+    int peerCount = (int)std::max(sendPeers.size(), recvPeers.size());
+
+    proxyOp->nPeers = std::max(1, peerCount);
+    break;
+  }
   case ncclPatternSend:
   case ncclPatternRecv:
   default:
