@@ -10,6 +10,7 @@
 #include "bootstrap.h"
 #include <nccl.h>
 #include <sstream>
+#include <set>
 
 NCCL_PARAM(MultiSegmentRegister, "MULTI_SEGMENT_REGISTER", 1);
 
@@ -90,12 +91,12 @@ fail:
 }
 
 // INFO: [HLC] Added bine connect.
-// FIXME: [HLC] Connect actual pairs.
 ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   if (comm == nullptr || comm->nRanks <= 1) return ret;
 
   const int nRanks = comm->nRanks;
+  const int rank = comm->rank;
   bool anySchedules = false;
   bool connectedAnyPeers = false;
   int connectedChannels = 0;
@@ -110,51 +111,18 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
 
     INFO(NCCL_INIT,
          "BINE channel %d context steps %d doublingSteps %d host(send=%p recv=%p partner=%p index=%p order=%p) dev(send=%p recv=%p partner=%p index=%p order=%p)",
-         c,
-         steps,
-         doublingSteps,
-         channel->bineSend,
-         channel->bineRecv,
-         channel->binePartner,
-         channel->bineIndex,
-         channel->bineOrder,
-         channel->devBineSend,
-         channel->devBineRecv,
-         channel->devBinePartner,
-         channel->devBineIndex,
-         channel->devBineOrder);
+         c, steps, doublingSteps,
+         channel->bineSend, channel->bineRecv, channel->binePartner, channel->bineIndex, channel->bineOrder,
+         channel->devBineSend, channel->devBineRecv, channel->devBinePartner, channel->devBineIndex, channel->devBineOrder);
 
     if (steps == 0 && doublingSteps == 0) {
       INFO(NCCL_INIT, "BINE channel %d has zero steps and will be skipped", c);
       continue;
     }
 
-    if (steps > 0) {
-      if (channel->bineSend == nullptr || channel->bineRecv == nullptr) {
-        WARN("BINE send/recv tables are missing for channel %d", c);
-        ret = ncclInternalError;
-        goto fail;
-      }
-    }
-    if (doublingSteps > 0) {
-      if (channel->binePartner == nullptr) {
-        WARN("BINE partner table is missing for channel %d", c);
-        ret = ncclInternalError;
-        goto fail;
-      }
-    }
-
-    auto isBineEnabledFor = [&](ncclFunc_t func) {
-      for (int proto = 0; proto < NCCL_NUM_PROTOCOLS; ++proto) {
-        if (comm->bandwidths[func][NCCL_ALGO_BINE][proto] > 0.0f) {
-          return true;
-        }
-      }
-      return false;
-    };
-
     const bool hasStepTables = steps > 0 && channel->bineSend && channel->bineRecv;
     const bool hasDoublingTables = doublingSteps > 0 && channel->binePartner;
+    
     if (steps > 0 && !hasStepTables) {
       WARN("BINE send/recv tables are missing for channel %d", c);
       ret = ncclInternalError;
@@ -166,23 +134,24 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       goto fail;
     }
 
-    const bool enableBroadcastPhase =
-        hasStepTables &&
-        (isBineEnabledFor(ncclFuncBroadcast) || isBineEnabledFor(ncclFuncAllReduce));
-    const bool enableReducePhase =
-        hasStepTables &&
-        (isBineEnabledFor(ncclFuncReduce) || isBineEnabledFor(ncclFuncReduceScatter) ||
-         isBineEnabledFor(ncclFuncAllReduce));
-    const bool enableDoublingPhase =
-        hasDoublingTables &&
-        (isBineEnabledFor(ncclFuncReduceScatter) || isBineEnabledFor(ncclFuncAllGather) ||
-         isBineEnabledFor(ncclFuncAllReduce));
+    auto isBineEnabledFor = [&](ncclFunc_t func) {
+      for (int proto = 0; proto < NCCL_NUM_PROTOCOLS; ++proto) {
+        if (comm->bandwidths[func][NCCL_ALGO_BINE][proto] > 0.0f) {
+          return true;
+        }
+      }
+      return false;
+    };
 
-    const bool channelHasEnabledPhase = enableBroadcastPhase || enableReducePhase || enableDoublingPhase;
-    if (!channelHasEnabledPhase) {
-      INFO(NCCL_INIT,
-           "BINE channel %d has valid tables but all phases disabled (env bandwidths <= 0)",
-           c);
+    const bool enableBroadcastPhase = hasStepTables && (isBineEnabledFor(ncclFuncBroadcast) || isBineEnabledFor(ncclFuncAllReduce));
+    const bool enableReducePhase = hasStepTables && (isBineEnabledFor(ncclFuncReduce) || isBineEnabledFor(ncclFuncReduceScatter) || isBineEnabledFor(ncclFuncAllReduce));
+    const bool enableDoublingPhase = hasDoublingTables && (isBineEnabledFor(ncclFuncReduceScatter) || isBineEnabledFor(ncclFuncAllGather) || isBineEnabledFor(ncclFuncAllReduce));
+
+    INFO(NCCL_INIT, "BINE transport init channel %d hasSteps %d doublingSteps %d enabled:\n\tbroadcast: %d\n\treduce: %d\n\tdoubling: %d",
+         c, steps, doublingSteps, enableBroadcastPhase, enableReducePhase, enableDoublingPhase);
+
+    if (!enableBroadcastPhase && !enableReducePhase && !enableDoublingPhase) {
+      INFO(NCCL_INIT, "BINE channel %d has valid tables but all phases disabled (env bandwidths <= 0)", c);
       continue;
     }
 
@@ -197,67 +166,54 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       if (recvFromPeer) recvPeers.push_back(peer);
     };
 
+    // Construct precise peer relationship tracking from schedules
     for (int root = 0; root < nRanks; ++root) {
-      const int rank = comm->rank;
       const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
 
-      if (steps > 0 && channel->bineSend && channel->bineRecv &&
-          (enableBroadcastPhase || enableReducePhase)) {
+      if (steps > 0 && (enableBroadcastPhase || enableReducePhase)) {
         std::ostringstream rootLog;
         bool rootHasComm = false;
+
         for (int step = 0; step < steps; ++step) {
           const int stepIdx = rootOffset + step;
           const int sendPeer = channel->bineSend[stepIdx];
           const int recvPeer = channel->bineRecv[stepIdx];
           std::vector<std::string> annotations;
+
           if (enableBroadcastPhase) {
             std::vector<std::string> bcastEntries;
-            if (sendPeer >= 0 && sendPeer != comm->rank) {
-              bcastEntries.push_back(std::string("send->") + std::to_string(sendPeer));
-            }
-            if (recvPeer >= 0 && recvPeer != comm->rank) {
-              bcastEntries.push_back(std::string("recv<-") + std::to_string(recvPeer));
-            }
+            if (sendPeer >= 0 && sendPeer != rank) bcastEntries.push_back("send->" + std::to_string(sendPeer));
+            if (recvPeer >= 0 && recvPeer != rank) bcastEntries.push_back("recv<-" + std::to_string(recvPeer));
             if (!bcastEntries.empty()) {
               std::ostringstream entry;
               entry << "bcast:";
-              for (size_t i = 0; i < bcastEntries.size(); ++i) {
-                if (i > 0) entry << ",";
-                entry << bcastEntries[i];
-              }
+              for (size_t i = 0; i < bcastEntries.size(); ++i) entry << (i > 0 ? "," : "") << bcastEntries[i];
               annotations.push_back(entry.str());
             }
           }
+          
           if (enableReducePhase) {
             std::vector<std::string> reduceEntries;
-            if (recvPeer >= 0 && recvPeer != comm->rank) {
-              reduceEntries.push_back(std::string("send->") + std::to_string(recvPeer));
-            }
-            if (sendPeer >= 0 && sendPeer != comm->rank) {
-              reduceEntries.push_back(std::string("recv<-") + std::to_string(sendPeer));
-            }
+            if (recvPeer >= 0 && recvPeer != rank) reduceEntries.push_back("send->" + std::to_string(recvPeer));
+            if (sendPeer >= 0 && sendPeer != rank) reduceEntries.push_back("recv<-" + std::to_string(sendPeer));
             if (!reduceEntries.empty()) {
               std::ostringstream entry;
               entry << "reduce:";
-              for (size_t i = 0; i < reduceEntries.size(); ++i) {
-                if (i > 0) entry << ",";
-                entry << reduceEntries[i];
-              }
+              for (size_t i = 0; i < reduceEntries.size(); ++i) entry << (i > 0 ? "," : "") << reduceEntries[i];
               annotations.push_back(entry.str());
             }
           }
+
           if (!annotations.empty()) {
             if (!rootHasComm) {
               rootLog << "BINE channel " << c << " root " << root << " steps:";
               rootHasComm = true;
             }
             rootLog << " H" << step << "[";
-            for (size_t i = 0; i < annotations.size(); ++i) {
-              if (i > 0) rootLog << ' ';
-              rootLog << annotations[i];
-            }
+            for (size_t i = 0; i < annotations.size(); ++i) rootLog << (i > 0 ? " " : "") << annotations[i];
             rootLog << "]";
           }
+
           if (enableBroadcastPhase) {
             addPeer(sendPeer, /*sendToPeer=*/true, /*recvFromPeer=*/false);
             addPeer(recvPeer, /*sendToPeer=*/false, /*recvFromPeer=*/true);
@@ -277,9 +233,9 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       std::ostringstream doublingLog;
       bool hasDoublingComm = false;
       for (int step = 0; step < doublingSteps; ++step) {
-        const int partner = channel->binePartner[comm->rank * doublingSteps + step];
+        const int partner = channel->binePartner[rank * doublingSteps + step];
         addPeer(partner, /*sendToPeer=*/true, /*recvFromPeer=*/true);
-        if (partner >= 0 && partner != comm->rank) {
+        if (partner >= 0 && partner != rank) {
           if (!hasDoublingComm) {
             doublingLog << "BINE channel " << c << " doubling steps:";
             hasDoublingComm = true;
@@ -310,14 +266,37 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       if (recvPeers.empty()) oss << " none";
       INFO(NCCL_INIT, "%s", oss.str().c_str());
 
-      NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c,
-          recvPeers.empty() ? 0 : (int)recvPeers.size(),
-          recvPeers.empty() ? nullptr : recvPeers.data(),
-          sendPeers.empty() ? 0 : (int)sendPeers.size(),
-          sendPeers.empty() ? nullptr : sendPeers.data(),
-          0), ret, fail);
-      connectedAnyPeers = true;
-      connectedChannels += 1;
+      // Collect complete set of uniquely identified communicating neighbors 
+      std::set<int> uniquePeers;
+      for (int p : sendPeers) uniquePeers.insert(p);
+      for (int p : recvPeers) uniquePeers.insert(p);
+
+      // Secure symmetric bidirectional registration per peer
+      bool channelConnectedAny = false;
+      for (int peer : uniquePeers) {
+        bool isRecv = std::find(recvPeers.begin(), recvPeers.end(), peer) != recvPeers.end();
+        bool isSend = std::find(sendPeers.begin(), sendPeers.end(), peer) != sendPeers.end();
+
+        int nRecv = isRecv ? 1 : 0;
+        int nSend = isSend ? 1 : 0;
+
+        NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c,
+                                              nRecv, nRecv ? &peer : nullptr,
+                                              nSend, nSend ? &peer : nullptr,
+                                              0), ret, fail);
+        channelConnectedAny = true;
+        connectedAnyPeers = true;
+      }
+
+      if (channelConnectedAny) {
+        connectedChannels += 1;
+      }
+
+      for (int peer : sendPeers)
+        INFO(NCCL_INIT, "BINE channel %d after connect: connectSend[%d] = %lx", c, peer, comm->connectSend[peer]);
+      for (int peer : recvPeers)
+        INFO(NCCL_INIT, "BINE channel %d after connect: connectRecv[%d] = %lx", c, peer, comm->connectRecv[peer]);
+
     } else {
       INFO(NCCL_INIT, "BINE channel %d produced no distinct peers after dedup", c);
     }
@@ -337,14 +316,19 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     ret = ncclInternalError;
     goto fail;
   }
+
+  // Execute standard NCCL P2P setup loop to clear bitmasks via standard out-of-band proxy threads
   NCCLCHECKGOTO(ncclTransportP2pSetup(comm, setupGraph, 0), ret, fail);
   INFO(NCCL_INIT, "Connected BINE peers on %d channels", connectedChannels);
 
+  for (int i = 0; i < comm->nRanks; ++i)
+    INFO(NCCL_INIT, "BINE connectSend[%d] = %lx", i, comm->connectSend[i]);
+  for (int i = 0; i < comm->nRanks; ++i)
+    INFO(NCCL_INIT, "BINE connectRecv[%d] = %lx", i, comm->connectRecv[i]);
+
 exit:
   if (!anySchedules) {
-    INFO(NCCL_INIT,
-         "BINE connect rank %d disabled: NCCL_ALGO tuning or bandwidths removed all phases",
-         comm->rank);
+    INFO(NCCL_INIT, "BINE connect rank %d disabled: NCCL_ALGO tuning or bandwidths removed all phases", comm->rank);
   }
   return ret;
 fail:

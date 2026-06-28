@@ -161,6 +161,8 @@ ncclResult_t ncclTransportPatConnect(struct ncclComm* comm);
 // INFO: [HLC] bine transport.
 ncclResult_t ncclTransportBineConnect(struct ncclComm* comm);
 
+ncclResult_t ncclTransportBineSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex);
+
 ncclResult_t ncclCollNetSetup(ncclComm_t comm, ncclComm_t parent, struct ncclTopoGraph* graphs[]);
 ncclResult_t ncclCollNetChainBufferSetup(ncclComm_t comm);
 ncclResult_t ncclCollNetDirectBufferSetup(ncclComm_t comm);

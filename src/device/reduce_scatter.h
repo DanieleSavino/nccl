@@ -8,6 +8,7 @@
 #include "device.h"
 #include "collectives.h"
 #include "primitives.h"
+#include <cstdio>
 
 namespace {
   template<typename T, typename RedOp, typename Proto>
@@ -55,131 +56,189 @@ namespace {
     }
   }
 
-  template <typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work)
-  {
-    ncclBine *bine = &ncclShmem.channel.bine;
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBine(int tid, int nthreads,
+                                        ncclDevWorkColl *work)
+{
+    if (tid == 0) printf("Running ReduceScatter BINE\n");
 
+    ncclBine *bine = &ncclShmem.channel.bine;
     const int steps = bine->nSteps;
-    if (steps == 0 || !bine->index || !bine->order)
-    {
-      runRing<T, RedOp, Proto>(tid, nthreads, work);
-      return;
+
+    if (steps == 0 || !bine->index || !bine->order) {
+        runRing<T, RedOp, Proto>(tid, nthreads, work);
+        return;
     }
 
     ssize_t count, gridOffset, channelCount, chunkCount;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                     &count, &gridOffset, &channelCount, &chunkCount);
 
-    if (channelCount == 0)
-      return;
+    if (channelCount == 0) return;
 
-    T *accumBuf = (T *)work->sendbuff;
+    T *accumBuf  = (T *)work->sendbuff;
     T *outputBuf = (T *)work->recvbuff;
 
-    const int nRanks = ncclShmem.comm.nRanks;
-    const int rank = ncclShmem.comm.rank;
+    const int nRanks  = ncclShmem.comm.nRanks;
+    const int rank    = ncclShmem.comm.rank;
     const int myIndex = bine->index[rank];
     const bool useDirect =
-        (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+        (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
+        (NCCL_P2P_READ | NCCL_P2P_WRITE);
 
-    int low = 0;
+    if (tid == 0)
+        printf("Rank: %d myIndex=%d nRanks=%d steps=%d\n",
+               rank, myIndex, nRanks, steps);
+
+    int low  = 0;
     int high = nRanks;
 
-    for (int step = 0; step < steps; ++step)
-    {
-      const int mid = (low + high) >> 1;
-      const bool keepLower = (myIndex < mid);
-      const int span = keepLower ? (high - mid) : (mid - low);
+    for (int step = 0; step < steps; ++step) {
+        const int  mid       = (low + high) >> 1;
+        const bool keepLower = (myIndex < mid);
 
-      int partner = -1;
-      if (span > 0)
-      {
-        const int partnerIdx = keepLower ? myIndex + span : myIndex - span;
-        const bool partnerInOppositeHalf = keepLower ? (partnerIdx >= mid && partnerIdx < high)
-                                                     : (partnerIdx >= low && partnerIdx < mid);
-        if (partnerIdx >= 0 && partnerIdx < nRanks && partnerInOppositeHalf)
-          partner = bine->order[partnerIdx];
-      }
+        const int keepLow  = keepLower ? low  : mid;
+        const int keepHigh = keepLower ? mid  : high;
+        const int sendLow  = keepLower ? mid  : low;
+        const int sendHigh = keepLower ? high : mid;
+        const int span     = keepHigh - keepLow;
 
-      if (partner >= 0)
-      {
-        const int recvBegin = keepLower ? low : mid;
-        const int sendBegin = keepLower ? mid : low;
-        const bool doPost = (step == steps - 1);
-        int peers[1] = {partner};
+        const int partnerIdx = keepLower ? (myIndex + span) : (myIndex - span);
+        int partner = -1;
+        if (partnerIdx >= 0 && partnerIdx < nRanks) {
+            const bool valid = keepLower
+                ? (partnerIdx >= mid  && partnerIdx < high)
+                : (partnerIdx >= low  && partnerIdx < mid);
+            if (valid)
+                partner = bine->order[partnerIdx];
+        }
 
-        auto runStepRobust = [&](auto &prims, bool direct)
-        {
-          for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount)
-          {
-            const ssize_t dataOffset = gridOffset + elemOffset;
-            const int nelem = (int)min(chunkCount, channelCount - elemOffset);
+        if (tid == 0)
+            printf("Rank: %d step=%d low=%d mid=%d high=%d myIndex=%d "
+                   "keepLower=%d keepRange=[%d,%d) sendRange=[%d,%d) "
+                   "span=%d partner=%d\n",
+                   rank, step, low, mid, high, myIndex, (int)keepLower,
+                   keepLow, keepHigh, sendLow, sendHigh, span, partner);
 
-            for (int i = 0; i < span; ++i)
-            {
-              int sIdx = sendBegin + i;
-              int rIdx = recvBegin + i;
+        if (partner >= 0) {
+            const bool isLastStep = (step == steps - 1);
+            int peers[1] = {partner};
 
-              int sRank = bine->order[sIdx];
-              int rRank = bine->order[rIdx];
+            // Construct Primitives once per step (once per peer),
+            // outside the chunk loop — same pattern as ring
+            if (useDirect) {
+                Primitives<T, RedOp, FanAsymmetric<1,1>, 1, Proto, 0> prims(
+                    tid, nthreads, peers, peers,
+                    accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
 
-              ssize_t sOffset = dataOffset + (ssize_t)sRank * count;
-              ssize_t rOffset = dataOffset + (ssize_t)rRank * count;
+                for (ssize_t elemOffset = 0;
+                     elemOffset < channelCount;
+                     elemOffset += chunkCount)
+                {
+                    const ssize_t dataOffset = gridOffset + elemOffset;
+                    const int nelem = (int)min(chunkCount,
+                                               channelCount - elemOffset);
+                    const bool isLastChunk =
+                        (elemOffset + chunkCount >= channelCount);
 
-              if (direct)
-                prims.directSendFromOutput(sOffset, nelem);
-              else
-                prims.sendFromOutput(sOffset, nelem);
+                    for (int i = sendLow; i < sendHigh; ++i) {
+                        const ssize_t offset =
+                            dataOffset + (ssize_t)bine->order[i] * count;
+                        if (tid == 0)
+                            printf("Rank: %d SEND to %d offset=%lld nelem=%d\n",
+                                   rank, partner, (long long)offset, nelem);
+                        prims.directSendFromOutput(offset, nelem);
+                    }
 
-              if (direct)
-                prims.directRecvReduceCopy(rOffset, rOffset, nelem, doPost);
-              else
-                prims.recvReduceCopy(rOffset, rOffset, nelem, doPost);
+                    for (int i = keepLow; i < keepHigh; ++i) {
+                        const ssize_t offset =
+                            dataOffset + (ssize_t)bine->order[i] * count;
+                        const bool isLastRecv  = (i == keepHigh - 1);
+                        const bool doPost =
+                            isLastStep && isLastChunk && isLastRecv;
+                        if (tid == 0)
+                            printf("Rank: %d RECV from %d offset=%lld "
+                                   "nelem=%d doPost=%d\n",
+                                   rank, partner, (long long)offset,
+                                   nelem, (int)doPost);
+                        prims.directRecvReduceCopy(offset, offset,
+                                                   nelem, doPost);
+                        if (tid == 0)
+                            printf("Rank: %d RECEIVED from %d offset=%lld\n",
+                                   rank, partner, (long long)offset);
+                    }
+                }
+            } else {
+                Primitives<T, RedOp, FanAsymmetric<1,1>, 0, Proto, 0> prims(
+                    tid, nthreads, peers, peers,
+                    accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
+
+                for (ssize_t elemOffset = 0;
+                     elemOffset < channelCount;
+                     elemOffset += chunkCount)
+                {
+                    const ssize_t dataOffset = gridOffset + elemOffset;
+                    const int nelem = (int)min(chunkCount,
+                                               channelCount - elemOffset);
+                    const bool isLastChunk =
+                        (elemOffset + chunkCount >= channelCount);
+
+                    for (int i = sendLow; i < sendHigh; ++i) {
+                        const ssize_t offset =
+                            dataOffset + (ssize_t)bine->order[i] * count;
+                        if (tid == 0)
+                            printf("Rank: %d SEND to %d offset=%lld nelem=%d\n",
+                                   rank, partner, (long long)offset, nelem);
+                        prims.sendFromOutput(offset, nelem);
+                    }
+
+                    for (int i = keepLow; i < keepHigh; ++i) {
+                        const ssize_t offset =
+                            dataOffset + (ssize_t)bine->order[i] * count;
+                        const bool isLastRecv  = (i == keepHigh - 1);
+                        const bool doPost =
+                            isLastStep && isLastChunk && isLastRecv;
+                        if (tid == 0)
+                            printf("Rank: %d RECV from %d offset=%lld "
+                                   "nelem=%d doPost=%d\n",
+                                   rank, partner, (long long)offset,
+                                   nelem, (int)doPost);
+                        prims.recvReduceCopy(offset, offset, nelem, doPost);
+                        if (tid == 0)
+                            printf("Rank: %d RECEIVED from %d offset=%lld\n",
+                                   rank, partner, (long long)offset);
+                    }
+                }
             }
-          }
-        };
-
-        if (useDirect)
-        {
-          Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prims(
-              tid, nthreads, peers, peers, accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
-          runStepRobust(prims, true);
         }
-        else
-        {
-          Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prims(
-              tid, nthreads, peers, peers, accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
-          runStepRobust(prims, false);
-        }
-      }
 
-      __syncthreads();
+        __syncthreads();
 
-      if (keepLower)
-        high = mid;
-      else
-        low = mid;
+        if (keepLower) high = mid;
+        else           low  = mid;
     }
 
+    // Copy result to output buffer if separate from accum
     const int finalOwnerRank = bine->order[low];
-    if (outputBuf != accumBuf)
-    {
-      const ssize_t chunkBase = (ssize_t)finalOwnerRank * count;
-      for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount)
-      {
-        const ssize_t dataOffset = gridOffset + elemOffset;
-        const int nelem = (int)min(chunkCount, channelCount - elemOffset);
-        const ssize_t dstOffset = dataOffset;
-        const ssize_t srcOffset = dataOffset + chunkBase;
+    if (tid == 0)
+        printf("Rank: %d final owner rank=%d\n", rank, finalOwnerRank);
 
-        for (ssize_t i = tid; i < (ssize_t)nelem; i += nthreads)
+    if (outputBuf != accumBuf) {
+        for (ssize_t elemOffset = 0;
+             elemOffset < channelCount;
+             elemOffset += chunkCount)
         {
-          outputBuf[dstOffset + i] = accumBuf[srcOffset + i];
+            const ssize_t dataOffset = gridOffset + elemOffset;
+            const int nelem = (int)min(chunkCount,
+                                       channelCount - elemOffset);
+            const ssize_t srcOffset =
+                dataOffset + (ssize_t)finalOwnerRank * count;
+            const ssize_t dstOffset = dataOffset;
+            for (ssize_t i = tid; i < (ssize_t)nelem; i += nthreads)
+                outputBuf[dstOffset + i] = accumBuf[srcOffset + i];
         }
-      }
     }
-  }
+}
 }
 
 template<typename T, typename RedOp>

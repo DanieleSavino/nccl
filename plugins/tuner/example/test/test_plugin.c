@@ -802,6 +802,7 @@ int test_tuner_constants() {
       {-1.0, -1.0, -1.0},    // NCCL_ALGO_NVLS
       {-1.0, -1.0, -1.0},    // NCCL_ALGO_NVLS_TREE
       {-1.0, -1.0, -1.0}     // NCCL_ALGO_PAT
+      {-1.0, -1.0, -1.0}     // NCCL_ALGO_BINE
     },
 
     // Hardware latencies: [NCCL_NUM_HW_LINKS][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS]
@@ -815,6 +816,7 @@ int test_tuner_constants() {
         {-1.0, -1.0, -1.0},    // NVLS
         {-1.0, -1.0, -1.0},    // NVLS_TREE
         {-1.0, -1.0, -1.0}     // PAT
+        {-1.0, -1.0, -1.0}     // BINE
       },
       // NCCL_HW_PCI
       {
@@ -825,6 +827,7 @@ int test_tuner_constants() {
         {-1.0, -1.0, -1.0},     // NVLS
         {-1.0, -1.0, -1.0},   // NVLS_TREE
         {-1.0, -1.0, -1.0}   // PAT
+        {-1.0, -1.0, -1.0}   // BINE
       },
       // NCCL_HW_NET
       {
@@ -835,6 +838,7 @@ int test_tuner_constants() {
         {-1.0, -1.0, -1.0},  // NVLS
         {-1.0, -1.0, -1.0},  // NVLS_TREE
         {-1.0, -1.0, -1.0}   // PAT
+        {-1.0, -1.0, -1.0}   // BINE
       }
     },
 

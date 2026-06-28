@@ -107,13 +107,13 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op) {
   bool needed = true;
   NCCLCHECK(ncclProxySaveOp(comm, op, &needed));
-  INFO(NCCL_INIT, "ncclAddProxyOpIfNeeded: algo=%d pattern=%d needed=%d connection=%p",
-       op->task.coll ? op->task.coll->algorithm : -1, op->pattern, needed, op->connection);
   if (needed) {
     struct ncclProxyOp* q = ncclMemoryPoolAlloc<struct ncclProxyOp>(&comm->memPool_ncclProxyOp, &comm->memPermanent);
     *q = *op; // C++ struct assignment
     ncclIntruQueueEnqueue(&comm->planner.wipPlan.channels[op->channelId].proxyOpQueue, q);
   }
+  INFO(NCCL_INIT, "ncclAddProxyOpIfNeeded: algo=%d pattern=%d needed=%d connection=%p",
+       op->task.coll ? op->task.coll->algorithm : -1, op->pattern, needed, op->connection);
   return ncclSuccess;
 }
 
@@ -2115,6 +2115,7 @@ static ncclResult_t calcCollChunking(
       return halvingSteps;
     case ncclFuncReduceScatter:
     case ncclFuncAllGather:
+    case ncclFuncAllGatherV:
       return doublingSteps;
     case ncclFuncAllReduce:
       return halvingSteps + doublingSteps;

@@ -314,6 +314,193 @@ fail:
   goto exit;
 }
 
+ncclResult_t ncclTransportBineSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, int connIndex) {
+  ncclResult_t ret = ncclSuccess;
+  struct ncclConnect** data = NULL; 
+  struct ncclConnect** recvData = NULL; 
+  struct ncclConnect** sendData = NULL; 
+  cudaStream_t hostStream, deviceStream;
+  bool allChannelsConnected = false;
+
+  // Allocate tracking arrays
+  NCCLCHECK(ncclCalloc(&data, comm->nRanks));
+  NCCLCHECKGOTO(ncclCalloc(&recvData, comm->nRanks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&sendData, comm->nRanks), ret, fail);
+
+  // Acquire streams for asynchronous device registration
+  NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream, /*concurrent=*/false, &hostStream), ret, fail);
+  NCCLCHECKGOTO(ncclStrongStreamAcquire(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->deviceStream, /*concurrent=*/false, &deviceStream), ret, fail);
+
+  // =====================================================================
+  // PHASE 1a: Broadcast / Send all connection metadata first (Non-blocking design)
+  // =====================================================================
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (peer == comm->rank) continue;
+
+    uint64_t recvMask = comm->connectRecv[peer];
+    uint64_t sendMask = comm->connectSend[peer];
+    if (!recvMask && !sendMask) continue;
+
+    // Generate unique, order-independent tags for every communicating pair
+    int lowRank = (comm->rank < peer) ? comm->rank : peer;
+    int highRank = (comm->rank > peer) ? comm->rank : peer;
+    int bootstrapTag = (lowRank << 16) + (highRank << 8) + 77; // Dedicated BINE tag space
+
+    if (data[peer] == NULL) {
+      NCCLCHECKGOTO(ncclCalloc(&data[peer], 2 * MAXCHANNELS), ret, fail);
+    }
+    recvData[peer] = data[peer];
+
+    int recvChannels = 0, sendChannels = 0, type;
+    for (int c = 0; c < MAXCHANNELS; c++) {
+      if (recvMask & (1ULL << c)) {
+        NCCLCHECKGOTO(selectTransport<0>(comm, graph, recvData[peer] + recvChannels++, c, peer, connIndex, &type), ret, fail);
+      }
+    }
+    
+    sendData[peer] = recvData[peer] + recvChannels;
+    for (int c = 0; c < MAXCHANNELS; c++) {
+      if (sendMask & (1ULL << c)) {
+        NCCLCHECKGOTO(selectTransport<1>(comm, graph, sendData[peer] + sendChannels++, c, peer, connIndex, &type), ret, fail);
+      }
+    }
+
+    // Push data out to network sockets immediately
+    if (recvChannels) {
+      NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, peer, bootstrapTag, recvData[peer], sizeof(struct ncclConnect) * recvChannels), ret, fail);
+    }
+    if (sendChannels) {
+      NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, peer, bootstrapTag, sendData[peer], sizeof(struct ncclConnect) * sendChannels), ret, fail);
+    }
+  }
+
+  // =====================================================================
+  // PHASE 1b: Collect / Receive all connection metadata
+  // =====================================================================
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (peer == comm->rank) continue;
+
+    uint64_t recvMask = comm->connectRecv[peer];
+    uint64_t sendMask = comm->connectSend[peer];
+    if (!recvMask && !sendMask) continue;
+
+    int lowRank = (comm->rank < peer) ? comm->rank : peer;
+    int highRank = (comm->rank > peer) ? comm->rank : peer;
+    int bootstrapTag = (lowRank << 16) + (highRank << 8) + 77;
+
+    int recvChannels = 0, sendChannels = 0;
+    for (int c = 0; c < MAXCHANNELS; c++) {
+      if (recvMask & (1ULL << c)) recvChannels++;
+      if (sendMask & (1ULL << c)) sendChannels++;
+    }
+
+    // Safely pull matching metadata structures from the ringless endpoints
+    if (sendChannels) {
+      NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, peer, bootstrapTag, sendData[peer], sizeof(struct ncclConnect) * sendChannels), ret, fail);
+    }
+    if (recvChannels) {
+      NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, peer, bootstrapTag, recvData[peer], sizeof(struct ncclConnect) * recvChannels), ret, fail);
+    }
+  }
+
+  // =====================================================================
+  // PHASE 2: Complete runtime transport mappings & IB Queue Pairs (QPs)
+  // =====================================================================
+  allChannelsConnected = false;
+  while (!allChannelsConnected) {
+    allChannelsConnected = true;
+    for (int peer = 0; peer < comm->nRanks; peer++) {
+      if (peer == comm->rank) continue;
+
+      uint64_t recvMask = comm->connectRecv[peer];
+      uint64_t sendMask = comm->connectSend[peer];
+      if (!recvMask && !sendMask) continue;
+
+      int sendDataOffset = 0;
+      int recvDataOffset = 0;
+
+      for (int c = 0; c < MAXCHANNELS; c++) {
+        if (sendMask & (1ULL << c)) {
+          struct ncclConnector* conn = comm->channels[c].peers[peer]->send + connIndex;
+          if (conn->connected == 0) {
+            NCCLCHECKGOTO(conn->transportComm->connect(comm, sendData[peer] + sendDataOffset, 1, comm->rank, conn), ret, fail);
+            if (ret == ncclSuccess) {
+              conn->connected = 1;
+              CUDACHECKGOTO(cudaMemcpyAsync(&comm->channels[c].devPeersHostPtr[peer]->send[connIndex], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, hostStream), ret, fail);
+            } else if (ret == ncclInProgress) {
+              allChannelsConnected = false;
+            }
+          }
+          sendDataOffset++;
+        }
+
+        if (recvMask & (1ULL << c)) {
+          struct ncclConnector* conn = comm->channels[c].peers[peer]->recv + connIndex;
+          if (conn->connected == 0) {
+            NCCLCHECKGOTO(conn->transportComm->connect(comm, recvData[peer] + recvDataOffset, 1, comm->rank, conn), ret, fail);
+            if (ret == ncclSuccess) {
+              conn->connected = 1;
+              CUDACHECKGOTO(cudaMemcpyAsync(&comm->channels[c].devPeersHostPtr[peer]->recv[connIndex], &conn->conn, sizeof(struct ncclConnInfo), cudaMemcpyHostToDevice, hostStream), ret, fail);
+            } else if (ret == ncclInProgress) {
+              allChannelsConnected = false;
+            }
+          }
+          recvDataOffset++;
+        }
+      }
+    }
+  }
+
+  // =====================================================================
+  // PHASE 3: Symmetric Barrier Execution to stabilize proxy connections
+  // =====================================================================
+  // Step 3a: Post all zero-byte synchronization barriers out to active peers
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (peer == comm->rank) continue;
+    if (comm->connectSend[peer] == 0UL && comm->connectRecv[peer] == 0UL) continue;
+
+    int lowRank = (comm->rank < peer) ? comm->rank : peer;
+    int highRank = (comm->rank > peer) ? comm->rank : peer;
+    int bootstrapTag = (lowRank << 16) + (highRank << 8) + (1 << 7) + 77; // Synced unique barrier tag
+
+    NCCLCHECKGOTO(bootstrapSend(comm->bootstrap, peer, bootstrapTag, NULL, 0), ret, fail);
+  }
+
+  // Step 3b: Wait for all peer synchronization acknowledges to land safely
+  for (int peer = 0; peer < comm->nRanks; peer++) {
+    if (peer == comm->rank) continue;
+    if (comm->connectSend[peer] == 0UL && comm->connectRecv[peer] == 0UL) continue;
+
+    int lowRank = (comm->rank < peer) ? comm->rank : peer;
+    int highRank = (comm->rank > peer) ? comm->rank : peer;
+    int bootstrapTag = (lowRank << 16) + (highRank << 8) + (1 << 7) + 77;
+
+    NCCLCHECKGOTO(bootstrapRecv(comm->bootstrap, peer, bootstrapTag, NULL, 0), ret, fail);
+
+    // Done with connection; safely wipe masks
+    comm->connectRecv[peer] = comm->connectSend[peer] = 0UL;
+  }
+
+exit:
+  // Gracefully clear all allocations
+  if (data) {
+    for (int i = 0; i < comm->nRanks; ++i) {
+      if (data[i]) free(data[i]);
+    }
+    free(data);
+  }
+  if (sendData) free(sendData);
+  if (recvData) free(recvData);
+
+  NCCLCHECK(ncclStreamWaitStream(deviceStream, hostStream, comm->sharedRes->scratchEvent));
+  NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->hostStream, /*concurrent=*/false));
+  NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &comm->sharedRes->deviceStream, /*concurrent=*/false));
+  return ret;
+
+fail:
+  goto exit;
+}
+
 extern struct ncclTransport collNetTransport;
 
 // All ranks must participate in collNetSetup call

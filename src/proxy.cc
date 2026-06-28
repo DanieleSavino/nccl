@@ -598,55 +598,72 @@ static ncclResult_t SaveProxyBine(struct ncclComm* comm, struct ncclChannel* cha
   const int doublingSteps = channel->bine.nDoublingSteps;
   const bool hasHalving = steps > 0 && channel->bineSend != nullptr && channel->bineRecv != nullptr;
   const bool hasDoubling = doublingSteps > 0 && channel->binePartner != nullptr;
+
   if (!hasHalving && !hasDoubling) return ncclSuccess;
 
-  std::vector<int> sendPeers;
-  std::vector<int> recvPeers;
-  sendPeers.reserve(nRanks);
-  recvPeers.reserve(nRanks);
   const int rank = comm->rank;
+  const bool includeBroadcastPhase = (op->coll == ncclFuncBroadcast || op->coll == ncclFuncAllReduce);
+  const bool includeReducePhase = (op->coll == ncclFuncReduce || op->coll == ncclFuncReduceScatter || op->coll == ncclFuncAllReduce);
 
-  const bool includeBroadcastPhase =
-      (op->coll == ncclFuncBroadcast || op->coll == ncclFuncAllReduce);
-  const bool includeReducePhase =
-      (op->coll == ncclFuncReduce || op->coll == ncclFuncReduceScatter || op->coll == ncclFuncAllReduce);
+  // Allocate tracking arrays for total steps required per peer in this call
+  int* peerSendSteps = nullptr;
+  int* peerRecvSteps = nullptr;
+  NCCLCHECK(ncclCalloc(&peerSendSteps, nRanks));
+  NCCLCHECK(ncclCalloc(&peerRecvSteps, nRanks));
 
-  int rootCount = (op->coll == ncclFuncBroadcast || op->coll == ncclFuncReduce) ? 1 : nRanks;
-  for (int rIndex = 0; rIndex < rootCount; ++rIndex) {
-    int root = (rootCount == 1) ? op->root : rIndex;
-    if (root < 0 || root >= nRanks) continue;
-    if (!hasHalving) continue;
-    const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
-    for (int step = 0; step < steps; ++step) {
-      const int stepIdx = rootOffset + step;
-      int sendPeer = channel->bineSend[stepIdx];
-      int recvPeer = channel->bineRecv[stepIdx];
-      if (includeBroadcastPhase) {
-        addUniqueBinePeer(sendPeer, rank, channel->id, sendPeers);
-        addUniqueBinePeer(recvPeer, rank, channel->id, recvPeers);
-      }
-      if (includeReducePhase) {
-        addUniqueBinePeer(sendPeer, rank, channel->id, recvPeers);
-        addUniqueBinePeer(recvPeer, rank, channel->id, sendPeers);
+  // 1. Accumulate steps from Halving Phase
+  if (hasHalving) {
+    int rootCount = (op->coll == ncclFuncBroadcast || op->coll == ncclFuncReduce) ? 1 : nRanks;
+    for (int rIndex = 0; rIndex < rootCount; ++rIndex) {
+      int root = (rootCount == 1) ? op->root : rIndex;
+      if (root < 0 || root >= nRanks) continue;
+
+      const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
+      for (int step = 0; step < steps; ++step) {
+        const int stepIdx = rootOffset + step;
+        int sendPeer = channel->bineSend[stepIdx];
+        int recvPeer = channel->bineRecv[stepIdx];
+
+        if (includeBroadcastPhase) {
+          if (sendPeer >= 0 && sendPeer != rank) peerSendSteps[sendPeer]++;
+          if (recvPeer >= 0 && recvPeer != rank) peerRecvSteps[recvPeer]++;
+        }
+        if (includeReducePhase) {
+          if (recvPeer >= 0 && recvPeer != rank) peerSendSteps[recvPeer]++;
+          if (sendPeer >= 0 && sendPeer != rank) peerRecvSteps[sendPeer]++;
+        }
       }
     }
   }
 
+  // 2. Accumulate steps from Doubling Phase
   if (hasDoubling) {
     for (int step = 0; step < doublingSteps; ++step) {
       int partner = channel->binePartner[rank * doublingSteps + step];
-      addUniqueBinePeer(partner, rank, channel->id, sendPeers);
-      addUniqueBinePeer(partner, rank, channel->id, recvPeers);
+      if (partner >= 0 && partner != rank) {
+        peerSendSteps[partner]++;
+        peerRecvSteps[partner]++;
+      }
     }
   }
 
-  for (int peer : recvPeers) {
-    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, peer, op, 0, justInquire));
+  // 3. Flush to NCCL Proxy Engine with matching op->nsteps allocations
+  ncclResult_t res = ncclSuccess;
+  for (int p = 0; p < nRanks; ++p) {
+    if (peerSendSteps[p] > 0) {
+      op->nsteps = peerSendSteps[p]; // Sync expected step counts for proxy progress
+      NCCLCHECKGOTO(SaveProxy(comm, channel, proxySend, p, op, 0, justInquire), res, cleanup);
+    }
+    if (peerRecvSteps[p] > 0) {
+      op->nsteps = peerRecvSteps[p]; // Sync expected step counts for proxy progress
+      NCCLCHECKGOTO(SaveProxy(comm, channel, proxyRecv, p, op, 0, justInquire), res, cleanup);
+    }
   }
-  for (int peer : sendPeers) {
-    NCCLCHECK(SaveProxy(comm, channel, proxySend, peer, op, 0, justInquire));
-  }
-  return ncclSuccess;
+
+cleanup:
+  free(peerSendSteps);
+  free(peerRecvSteps);
+  return res;
 }
 
 // justInquire != nullptr means don't actually do anything, just assertain need of
