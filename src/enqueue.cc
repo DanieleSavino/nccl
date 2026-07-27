@@ -17,6 +17,7 @@
 #include "register_inline.h"
 #include "ce_coll.h"
 #include "nvtx.h"
+#include "bine.h"
 #include "scheduler.h"
 #include "compiler.h"
 #include "rma/rma.h"
@@ -2445,9 +2446,8 @@ static ncclResult_t calcCollChunking(
 
         for (int step = 0; step < steps; ++step)
         {
-          size_t stepIdx = ((size_t)root * nRanks + rank) * steps + step;
-          int sendPeer = channel->bineSend[stepIdx];
-          int recvPeer = channel->bineRecv[stepIdx];
+          int sendPeer = ncclBineTreeSend(channel->bineSend, nRanks, steps, root, rank, step);
+          int recvPeer = ncclBineTreeRecv(channel->bineRecv, nRanks, steps, root, rank, step);
 
           if (sendPeer >= 0 && sendPeer != rank)
             sendPeers.push_back(sendPeer);

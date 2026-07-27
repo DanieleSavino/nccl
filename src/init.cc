@@ -677,7 +677,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
         comm->channels[c].bineSend != nullptr && comm->channels[c].devBineSend != nullptr &&
         comm->channels[c].bineRecv != nullptr && comm->channels[c].devBineRecv != nullptr)
     {
-      size_t halvingElems = (size_t)comm->channels[c].bine.nSteps * nRanks * nRanks;
+      size_t halvingElems = (size_t)comm->channels[c].bine.nSteps * nRanks;
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.send, comm->channels[c].bineSend, halvingElems, deviceStream), ret, fail);
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.recv, comm->channels[c].bineRecv, halvingElems, deviceStream), ret, fail);
     }
@@ -1656,7 +1656,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     // - halvingElems: per-rank send/recv tables across all steps (nRanks × nRanks × steps)
     // - doublingElems: partner index table across all steps  (nRanks × steps)
     // - mapElems:     per-rank index/order maps              (nRanks)
-    const size_t halvingElems  = (size_t)comm->nRanks * comm->nRanks * bineSteps;
+    const size_t halvingElems  = (size_t)comm->nRanks * bineSteps;
     const size_t doublingElems = (size_t)comm->nRanks * bineSteps;
     const size_t mapElems      = (size_t)comm->nRanks;
 

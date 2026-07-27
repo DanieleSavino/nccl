@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "transport.h"
 #include "bootstrap.h"
+#include "bine.h"
 #include <nccl.h>
 #include <sstream>
 
@@ -199,16 +200,15 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
 
     for (int root = 0; root < nRanks; ++root) {
       const int rank = comm->rank;
-      const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
 
       if (steps > 0 && channel->bineSend && channel->bineRecv &&
           (enableBroadcastPhase || enableReducePhase)) {
         std::ostringstream rootLog;
         bool rootHasComm = false;
         for (int step = 0; step < steps; ++step) {
-          const int stepIdx = rootOffset + step;
-          const int sendPeer = channel->bineSend[stepIdx];
-          const int recvPeer = channel->bineRecv[stepIdx];
+          int sendPeer = ncclBineTreeSend(channel->bineSend, nRanks, steps, root, rank, step);
+          int recvPeer = ncclBineTreeRecv(channel->bineRecv, nRanks, steps, root, rank, step);
+
           std::vector<std::string> annotations;
           if (enableBroadcastPhase) {
             std::vector<std::string> bcastEntries;

@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "device.h"
+#include "bine.h"
 #include "collectives.h"
 #include "primitives.h"
 #include <cmath>
@@ -62,59 +63,45 @@ namespace {
     if (isNetOffload) barrier_sync(14, nthreads);
   }
 
-  // INFO:  [HLC] Added Bine broadcast implementation.
+// INFO:  [HLC] Added Bine broadcast implementation.
   template <typename T, typename RedOp, typename Proto>
   __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work)
   {
     ncclBine *bine = &ncclShmem.channel.bine;
-
     const int nSteps = bine->nSteps;
     const int rank   = ncclShmem.comm.rank;
     const int nRanks = ncclShmem.comm.nRanks;
     const int root   = work->root;
-
     // Determine whether zero-copy (direct) paths are available for this operation.
     const bool canDirectRecv = (work->direct & NCCL_P2P_READ)  != 0;
     const bool canDirectSend = (work->direct & NCCL_P2P_WRITE) != 0;
-
     ssize_t chunkCount;
     ssize_t channelCount;
     ssize_t gridOffset;
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                     (ssize_t *)nullptr, &gridOffset, &channelCount, &chunkCount);
-
     size_t offset;
     int    nelem;
-
     // The root broadcasts from sendbuff; all other ranks work in-place on recvbuff.
     const T *sendBuff = (rank == root) ? (const T *)work->sendbuff
                                       : (const T *)work->recvbuff;
     T *recvBuff = (T *)work->recvbuff;
-
-    // Base index into the Bine send/recv tables for the (root, rank) pair.
-    // Table layout: [root * nRanks + rank][step].
-    const size_t rootOffset = ((size_t)root * nRanks + rank) * nSteps;
     for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
       offset = gridOffset + elemOffset;
       nelem  = min(chunkCount, channelCount - elemOffset);
-
       for (int step = 0; step < nSteps; ++step)
       {
-        int stepIdx  = rootOffset + step;
-        int sendPeer = bine->send[stepIdx];
-        int recvPeer = bine->recv[stepIdx];
-
+        // bine->send/recv hold only the root=0 basis table [nRanks * nSteps];
+        // rotate it for the actual root/rank here.
+        int sendPeer = ncclBineTreeSend(bine->send, nRanks, nSteps, root, rank, step);
+        int recvPeer = ncclBineTreeRecv(bine->recv, nRanks, nSteps, root, rank, step);
         // A step with no active peer on either side can be skipped entirely.
         if (sendPeer == -1 && recvPeer == -1)
           continue;
-
         // Each step is strictly one-directional: exactly one of send/recv is active.
         assert(sendPeer == -1 || recvPeer == -1);
-
         int recvPeers[1] = {recvPeer};
         int sendPeers[1] = {sendPeer};
-
-
         if (recvPeer != -1)
         {
           Primitives<T, RedOp, FanAsymmetric<1, 0>, 1, Proto, 0>
@@ -142,7 +129,6 @@ namespace {
         }
       }
     }
-
     // After the Bine steps, the root must copy its own data from sendbuff into recvbuff
     // so that its output is consistent with every other rank's recvbuff.
     if (rank == root && work->sendbuff != work->recvbuff)

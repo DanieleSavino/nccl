@@ -364,12 +364,12 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   // -------------------------------------------------------------------------
   // Allocate and populate the schedule tables.
   //
-  // Halving tables (send/recv): indexed as [rank * nRanks + peerRank][step],
-  //   total size nRanks × nRanks × steps.
+  // Halving tables (send/recv): indexed as [nRanks][step],
+  //   total size nRanks × steps.
   // Doubling tables (partner/index/order): indexed as [rank][step],
   //   total size nRanks × steps (or nRanks for the per-rank maps).
   // -------------------------------------------------------------------------
-  const size_t halvingTableElems  = (size_t)nRanks * nRanks * steps;
+  const size_t halvingTableElems  = (size_t)nRanks * steps;
   const size_t doublingTableElems = (size_t)nRanks * steps;
 
   std::vector<int> sendTable(halvingTableElems,  -1);
@@ -379,7 +379,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   std::vector<int> orderMap(nRanks, 0);
 
   // Fill the recursive-halving send/recv schedule.
-  ncclGetBineTreeDhlv(nRanks, steps,
+  ncclGetBineTree(nRanks, steps,
                       sendTable.data(),
                       recvTable.data());
 
@@ -412,7 +412,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
     INFO(NCCL_GRAPH, "%s", oss.str().c_str());
   };
 
-  const size_t myHalvingOffset  = (size_t)comm->rank * nRanks * steps; // row in the halving table
+  const size_t myHalvingOffset  = (size_t)comm->nRanks * steps; // row in the halving table
   const size_t myDoublingOffset = (size_t)comm->rank * steps;           // row in the doubling table
 
   logScheduleRow("send schedule",    sendTable,    myHalvingOffset,  steps);

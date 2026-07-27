@@ -80,7 +80,7 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   channel->devBineIndex = nullptr;
   channel->devBineOrder = nullptr;
   if (bineSteps > 0) {
-    size_t halvingElems = (size_t)nRanks * nRanks * bineSteps;
+    size_t halvingElems = (size_t)nRanks * bineSteps;
     size_t doublingElems = (size_t)nRanks * bineSteps;
     if (comm->sharedBineSend == nullptr) {
       comm->sharedBineSend = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingElems);

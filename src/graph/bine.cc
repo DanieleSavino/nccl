@@ -10,7 +10,6 @@
 #include <fstream>
 #include <sstream>
 #include "bine.h"
-#include "device/bine_utils.h"
 
 // ------------------------------------------------------------
 // HALVING schedule builder
@@ -19,7 +18,11 @@
 // Builds the virtual (root=0) halving broadcast schedule.
 // For each rank, determines at which step it receives data and to which
 // children it forwards in subsequent steps, using negabinary arithmetic.
-static void ncclGetVirtualBineTreeDhlv(int nRanks, int steps, int *sendTable, int *recvTable)
+//
+// sendTable/recvTable are sized [nRanks * steps] and hold the root=0 schedule.
+// To get the schedule for an arbitrary root, use ncclGetBineTreeForRoot
+// below rather than materializing a full root x rank x step table.
+void ncclGetBineTree(int nRanks, int steps, int *sendTable, int *recvTable)
 {
   if (nRanks <= 0 || !sendTable || !recvTable)
     return;
@@ -100,47 +103,6 @@ static void ncclGetVirtualBineTreeDhlv(int nRanks, int steps, int *sendTable, in
   }
 }
 
-// Builds the full halving send/recv schedule for all (root, rank) pairs
-// by rotating the virtual (root=0) schedule for each possible root.
-// Table layout: [root * nRanks + rank][step].
-void ncclGetBineTreeDhlv(int nRanks, int steps, int *sendTable, int *recvTable)
-{
-  if (nRanks <= 0 || !sendTable || !recvTable)
-    return;
-  assert((1 << steps) == nRanks && "nRanks must be a power of two");
-
-  // Build the virtual schedule first (root=0 basis).
-  const size_t vrElems = (size_t)nRanks * steps;
-  std::vector<int> virtualSend(vrElems, -1);
-  std::vector<int> virtualRecv(vrElems, -1);
-  ncclGetVirtualBineTreeDhlv(nRanks, steps, virtualSend.data(), virtualRecv.data());
-
-  // Rotate the virtual schedule for each root by shifting rank indices modulo nRanks.
-  const size_t blockStride = (size_t)nRanks * steps;
-  const size_t totalElems  = (size_t)nRanks * blockStride;
-  std::fill(sendTable, sendTable + totalElems, -1);
-  std::fill(recvTable, recvTable + totalElems, -1);
-
-  for (int root = 0; root < nRanks; ++root)
-  {
-    for (int rank = 0; rank < nRanks; ++rank)
-    {
-      // Virtual rank is the rank's position relative to the current root.
-      const int    vrank   = pmod(rank - root, nRanks);
-      const size_t dstBase = ((size_t)root * blockStride) + (size_t)rank * steps;
-      const size_t srcBase = (size_t)vrank * steps;
-
-      for (int step = 0; step < steps; ++step)
-      {
-        const int sendVR = virtualSend[srcBase + step];
-        const int recvVR = virtualRecv[srcBase + step];
-        // Translate virtual peer ranks back to physical ranks for this root.
-        sendTable[dstBase + step] = (sendVR < 0) ? -1 : pmod(sendVR + root, nRanks);
-        recvTable[dstBase + step] = (recvVR < 0) ? -1 : pmod(recvVR + root, nRanks);
-      }
-    }
-  }
-}
 
 // ------------------------------------------------------------
 // DOUBLING schedule builder

@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "device.h"
+#include "bine.h"
 #include "collectives.h"
 #include "primitives.h"
 
@@ -53,7 +54,7 @@ namespace {
     }
   }
 
-  template <typename T, typename RedOp, typename Proto>
+template <typename T, typename RedOp, typename Proto>
   __device__ __forceinline__ void runBine(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
     ncclBine *bine = &ncclShmem.channel.bine;
@@ -67,21 +68,23 @@ namespace {
 
     const int rank = ncclShmem.comm.rank;
     const int nRanks = ncclShmem.comm.nRanks;
+    const int nSteps = bine->nSteps;
     const int root = work->root;
     const bool isRoot = (rank == root);
     const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) != 0;
 
     bool hasReduced = false;
 
-    const size_t rootOffset = ((size_t)root * nRanks + rank) * bine->nSteps;
-
     __syncthreads();
 
-    for (int step = bine->nSteps - 1; step >= 0; --step)
+    for (int step = nSteps - 1; step >= 0; --step)
     {
-      const int stepIdx = rootOffset + step;
-      const int sendPeer = bine->recv[stepIdx];
-      const int recvPeer = bine->send[stepIdx];
+      // INFO: bine->send/recv hold only the root=0 basis table [nRanks * nSteps];
+      // rotate it for the actual root/rank here. Note the roles are swapped
+      // vs. the broadcast: this is a reduce walking up the tree, so the
+      // "recv" table's peer is who we send to, and vice versa.
+      const int sendPeer = ncclBineTreeRecv(bine->recv, nRanks, nSteps, root, rank, step);
+      const int recvPeer = ncclBineTreeSend(bine->send, nRanks, nSteps, root, rank, step);
 
       if (recvPeer >= 0)
       {

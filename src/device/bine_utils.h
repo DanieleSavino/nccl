@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <assert.h>
 #include <stddef.h>
+#include "nccl_device/utility.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define BINE_UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -385,13 +386,13 @@ static inline int remap_ddbl(uint32_t num) {
     return remapped;
 }
 
-static inline int pmod(int x, int m)
+NCCL_HOST_DEVICE_INLINE int pmod(int x, int m)
 {
   int r = x % m;
   return r < 0 ? r + m : r;
 }
 
-static inline size_t idx(int vr, int step, int steps)
+NCCL_HOST_DEVICE_INLINE size_t idx(int vr, int step, int steps)
 {
   return (size_t)vr * steps + step;
 }

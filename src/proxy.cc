@@ -7,6 +7,7 @@
 
 #include "comm.h"
 #include "info.h"
+#include "bine.h"
 #include "collectives.h"
 #include "socket.h"
 #include "shmutils.h"
@@ -616,11 +617,10 @@ static ncclResult_t SaveProxyBine(struct ncclComm* comm, struct ncclChannel* cha
     int root = (rootCount == 1) ? op->root : rIndex;
     if (root < 0 || root >= nRanks) continue;
     if (!hasHalving) continue;
-    const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
     for (int step = 0; step < steps; ++step) {
-      const int stepIdx = rootOffset + step;
-      int sendPeer = channel->bineSend[stepIdx];
-      int recvPeer = channel->bineRecv[stepIdx];
+      int sendPeer = ncclBineTreeSend(channel->bineSend, nRanks, steps, root, rank, step);
+      int recvPeer = ncclBineTreeRecv(channel->bineRecv, nRanks, steps, root, rank, step);
+
       if (includeBroadcastPhase) {
         addUniqueBinePeer(sendPeer, rank, channel->id, sendPeers);
         addUniqueBinePeer(recvPeer, rank, channel->id, recvPeers);
