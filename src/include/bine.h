@@ -4,6 +4,8 @@
 #include "nccl_device/utility.h"
 #include "device/bine_utils.h"
 
+#include <stddef.h>
+
 // Root=0 basis: fills sendTable/recvTable, each sized [nRanks * steps].
 void ncclGetBineTree(int nRanks, int steps, int *sendTable, int *recvTable);
 void ncclGetBineButterflyDdbl(int nRanks, int steps, int *partners, int *index, int *order);

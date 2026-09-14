@@ -11,6 +11,7 @@
 #include "bine.h"
 #include <nccl.h>
 #include <sstream>
+#include "bine_helper.h"
 
 NCCL_PARAM(MultiSegmentRegister, "MULTI_SEGMENT_REGISTER", 1);
 
@@ -273,9 +274,27 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       }
     }
 
+    // FIXME: [HLC] Temp, expose to user eventually.
+    const ncclBineBufferManagement_t buffMan = BLOCK_BY_BLOCK;
+
     if (enableDoublingPhase) {
       std::ostringstream doublingLog;
       bool hasDoublingComm = false;
+
+      // Pre-step (SEND/runBine only): one-time redistribution of this rank's
+      // own chunk into position-space slot before the doubling steps begin.
+      if (buffMan == SEND) {
+        const int redistTo   = channel->bineIndex[comm->rank];
+        const int redistFrom = channel->bineOrder[comm->rank];
+        if (redistTo != comm->rank) {
+          addPeer(redistTo,   /*sendToPeer=*/true,  /*recvFromPeer=*/false);
+          addPeer(redistFrom, /*sendToPeer=*/false, /*recvFromPeer=*/true);
+          doublingLog << "BINE channel " << c << " pre-step: send->" << redistTo
+                       << " recv<-" << redistFrom;
+          hasDoublingComm = true;
+        }
+      }
+
       for (int step = 0; step < doublingSteps; ++step) {
         const int partner = channel->binePartner[comm->rank * doublingSteps + step];
         addPeer(partner, /*sendToPeer=*/true, /*recvFromPeer=*/true);

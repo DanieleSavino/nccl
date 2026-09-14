@@ -83,9 +83,130 @@ namespace {
     if (isNetOffload) barrier_sync(14, nthreads);
   }
 
-// INFO:  [HLC] Added Bine allgather implementation.
   template <typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work)
+  __device__ __forceinline__ void runBineSend(int tid, int nthreads, ncclDevWorkColl *work)
+  {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const int steps = bine->nDoublingSteps;
+
+    ssize_t count, gridOffset, channelCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                    &count, &gridOffset, &channelCount, &chunkCount);
+
+    if (channelCount == 0)
+      return;
+
+    T *recvBuf = (T *)work->recvbuff;
+    T *sendBuf = (T *)work->sendbuff;
+    const int rank  = ncclShmem.comm.rank;
+    const int myIdx = bine->index[rank];
+
+    const int redistTo   = bine->index[rank]; // where my own chunk needs to end up
+    const int redistFrom = bine->order[rank]; // who owns the chunk that belongs at my slot
+
+    const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+    T *mySeg = recvBuf + (ssize_t)rank * count;
+
+    // --- Pre-step: redistribute just the OWN (count-sized) contribution so
+    // that, afterwards, buffer slot `rank` holds exactly what position-space
+    // expects to find there. This is the one-time cost that lets every
+    // subsequent doubling step use raw contiguous addressing with zero
+    // order[]/index[] lookups and a single bulk primitive call.
+    if (redistTo == rank) {
+      // I'm a fixed point of the permutation: plain local copy, as before.
+      if (sendBuf != mySeg) {
+        for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
+          mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
+      }
+    } else {
+      // Genuine cross-rank move: src (sendBuf) != dst (recvBuf), so this must
+      // use the plain send/recv primitives, NOT the *FromOutput variants
+      // (which always operate on the constructor's single output buffer).
+      int sendPeer[1] = {redistTo};
+      int recvPeer[1] = {redistFrom};
+      if (useDirect) {
+        Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
+            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+        // directSend needs (localInpIx, remoteOutIx, eltN) since input/output
+        // buffers differ here; remoteOutIx == gridOffset because chunking is
+        // identical across ranks for this channel.
+        prim.directSend(gridOffset, gridOffset, channelCount);
+        prim.directRecv(gridOffset, channelCount);
+      } else {
+        Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
+            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+        prim.send(gridOffset, channelCount);
+        prim.recv(gridOffset, channelCount);
+      }
+    }
+    __syncthreads();
+
+    // --- Main doubling steps: pure position-space addressing (myIdx-based),
+    // no order[] indirection, one bulk send/recv per step instead of a
+    // span-sized loop of tiny messages.
+    for (ssize_t elem = 0; elem < channelCount; elem += chunkCount)
+    {
+      const ssize_t dataOff = gridOffset + elem;
+      const int ne = (int)min(chunkCount, channelCount - elem);
+
+      for (int s = 0; s < steps; ++s)
+      {
+        const int partner = bine->partners[rank * steps + s];
+        if (partner < 0)
+          continue;
+
+        const int span      = 1 << s;
+        const int blockSize = span << 1;
+        const int base      = (myIdx / blockSize) * blockSize;
+        const bool keepLower = ((myIdx >> s) & 1) == 0;
+
+        const int sendBeg = keepLower ? base : base + span;
+        const int recvBeg = keepLower ? base + span : base;
+
+        int peers[1] = {partner};
+
+        if (ne == (int)count) {
+          // Fast path: whole blocks in range -> truly contiguous, one call.
+          const ssize_t sendOff  = (ssize_t)sendBeg * count + dataOff - gridOffset; // == sendBeg*count + elem
+          const ssize_t recvOff  = (ssize_t)recvBeg * count + dataOff - gridOffset;
+          const ssize_t nElemStep = (ssize_t)span * count;
+
+          if (useDirect) {
+            Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+            prim.directSendFromOutput(sendOff, nElemStep);
+            prim.directRecv(recvOff, nElemStep);
+          } else {
+            Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+            prim.sendFromOutput(sendOff, nElemStep);
+            prim.recv(recvOff, nElemStep);
+          }
+        } else {
+          // channelCount is pipelined into sub-chunks smaller than a full
+          // block: a span of blocks is no longer one contiguous memory
+          // region at this granularity, so fall back to per-block calls
+          // for correctness.
+          for (int j = 0; j < span; ++j) {
+            ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
+            ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
+            if (useDirect) {
+              Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+              prim.directSendFromOutput(sOff, ne);
+              prim.directRecv(rOff, ne);
+            } else {
+              Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+              prim.sendFromOutput(sOff, ne);
+              prim.recv(rOff, ne);
+            }
+          }
+        }
+      }
+      __syncthreads(); // steps must serialize: step s+1 depends on data landed in step s
+    }
+  }
+
+  template <typename T, typename RedOp, typename Proto>
+  __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads, ncclDevWorkColl *work)
   {
     ncclBine *bine = &ncclShmem.channel.bine;
     const int steps = bine->nDoublingSteps;
@@ -653,13 +774,14 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_P
   }
 };
 
+// FIXME: [HLC] Temp, expose Buff Modes to user eventually.
 template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE>
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
     using Proto = ProtoSimple<ALLGATHER_CHUNKSTEPS / ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>;
-    runBine<T, RedOp, Proto>(tid, nthreads, work);
+    runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
   }
 };
 
@@ -668,7 +790,7 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL>
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBine<T, RedOp, ProtoLL>(tid, nthreads, work);
+    runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
   }
 };
 
@@ -677,6 +799,6 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBine<T, RedOp, ProtoLL128>(tid, nthreads, work);
+    runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
   }
 };

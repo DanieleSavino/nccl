@@ -8,6 +8,8 @@
 #ifndef _NCCL_DEVICE_UTILITY_H_
 #define _NCCL_DEVICE_UTILITY_H_
 
+#include <stddef.h>
+
 // compiler specific check for __CUDACC__
 #ifndef NCCL_CHECK_CUDACC
     #if defined(__clang__)
