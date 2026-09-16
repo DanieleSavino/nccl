@@ -8,6 +8,7 @@
 #include "device.h"
 #include "collectives.h"
 #include "primitives.h"
+#include <cstdio>
 
 namespace {
   template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
@@ -780,8 +781,28 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPL
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
     using Proto = ProtoSimple<ALLGATHER_CHUNKSTEPS / ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>;
-    runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, Proto>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
 };
 
@@ -790,7 +811,26 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL>
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, ProtoLL>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
 };
 
@@ -799,6 +839,25 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, ProtoLL128>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
-};
+}

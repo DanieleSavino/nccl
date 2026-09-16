@@ -10,7 +10,7 @@
 #include "comm.h"
 #include "include/bine_helper.h"
 #include "info.h"
-#include "nccl_helper.h"
+#include "bine_helper.h"
 #include "shmutils.h"
 #include "socket.h"
 #define ENABLE_TIMER 0

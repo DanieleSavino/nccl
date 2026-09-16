@@ -5,6 +5,8 @@
  * See LICENSE.txt for more license information
  *************************************************************************/
 
+#include "include/bine_helper.h"
+#include "include/debug.h"
 #include "nccl.h"
 #include "channel.h"
 #include "nvmlwrap.h"
@@ -14,6 +16,7 @@
 #include "group.h"
 #include "net.h"
 #include "coll_net.h"
+#include <ctime>
 #if defined(NCCL_OS_WINDOWS)
 #include "gin/gin_host_win_stub.h"
 #else
@@ -652,6 +655,18 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.comm.collNetDenseToUserRank, comm->collNetDenseToUserRank, nRanks, deviceStream), ret, fail);
   }
 
+  ncclBineBufferManagement_t bineBufMgmt;
+  bineBufMgmt = BLOCK_BY_BLOCK; // default
+
+  const char* str;
+  str = ncclGetEnv("NCCL_BINE_BUFFER_MANAGEMENT");
+  if (str == NULL) {
+    WARN("NCCL_BINE_BUFFER_MANAGEMENT not set, defaulting to BLOCK_BY_BLOCK");
+  }
+  else {
+    NCCLCHECKGOTO(ncclBineBufferManagementFromString(str, &bineBufMgmt), ret, fail);
+  }
+
   for (int c=0; c < MAXCHANNELS; c++) {
     tmpCommAndChans.channels[c].peers = comm->channels[c].devPeers;
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
@@ -667,6 +682,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.channels[c].bine.partners = comm->channels[c].devBinePartner;
     tmpCommAndChans.channels[c].bine.index = comm->channels[c].devBineIndex;
     tmpCommAndChans.channels[c].bine.order = comm->channels[c].devBineOrder;
+    tmpCommAndChans.channels[c].bine.bufferManagement = bineBufMgmt;
 
     if (comm->channels[c].ring.userRanks != nullptr) {
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].ring.userRanks, comm->channels[c].ring.userRanks, nRanks, deviceStream), ret, fail);

@@ -12,7 +12,7 @@
 #include "bootstrap.h"
 #include "channel.h"
 #include "cudawrap.h"
-#include "include/nccl_helper.h"
+#include "include/bine_helper.h"
 #include "profiler.h"
 #include "transport.h"
 #include "register_inline.h"
