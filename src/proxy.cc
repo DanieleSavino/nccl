@@ -673,8 +673,8 @@ static ncclResult_t SaveProxy(struct ncclComm *comm,
 static ncclResult_t SaveProxyBine(struct ncclComm *comm,
                                   struct ncclChannel *channel,
                                   struct ncclProxyOp *op, bool *justInquire) {
-  // FIXME: [HLC] Temp, expose to user eventually.
-  const ncclBineBufferManagement_t buffMan = BLOCK_BY_BLOCK;
+
+  const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
 
   const int nRanks = comm->nRanks;
   if (nRanks <= 1)
@@ -770,8 +770,9 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm,
       break;
 
     case SEND: {
-      const int redistTo = channel->bineIndex[rank];
-      const int redistFrom = channel->bineOrder[rank];
+
+      const int redistTo = channel->bineOrder[rank];
+      const int redistFrom = channel->bineIndex[rank];
       if (redistTo != rank) {
         op->nsteps = nLoops * chunkSteps;
         NCCLCHECK(SaveProxy(comm, channel, proxyRecv, redistFrom, op, 0, justInquire));

@@ -111,10 +111,11 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     const int doublingSteps = channel->bine.nDoublingSteps;
 
     INFO(NCCL_INIT,
-         "BINE channel %d context steps %d doublingSteps %d host(send=%p recv=%p partner=%p index=%p order=%p) dev(send=%p recv=%p partner=%p index=%p order=%p)",
+         "BINE channel %d context steps %d doublingSteps %d bufferManagement %s host(send=%p recv=%p partner=%p index=%p order=%p) dev(send=%p recv=%p partner=%p index=%p order=%p)",
          c,
          steps,
          doublingSteps,
+         ncclBineBufferManagementToString(channel->bine.bufferManagement),
          channel->bineSend,
          channel->bineRecv,
          channel->binePartner,
@@ -274,8 +275,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       }
     }
 
-    // FIXME: [HLC] Temp, expose to user eventually.
-    const ncclBineBufferManagement_t buffMan = BLOCK_BY_BLOCK;
+    const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
 
     if (enableDoublingPhase) {
       std::ostringstream doublingLog;
@@ -284,8 +284,8 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       // Pre-step (SEND/runBine only): one-time redistribution of this rank's
       // own chunk into position-space slot before the doubling steps begin.
       if (buffMan == SEND) {
-        const int redistTo   = channel->bineIndex[comm->rank];
-        const int redistFrom = channel->bineOrder[comm->rank];
+        const int redistTo   = channel->bineOrder[comm->rank];
+        const int redistFrom = channel->bineIndex[comm->rank];
         if (redistTo != comm->rank) {
           addPeer(redistTo,   /*sendToPeer=*/true,  /*recvFromPeer=*/false);
           addPeer(redistFrom, /*sendToPeer=*/false, /*recvFromPeer=*/true);

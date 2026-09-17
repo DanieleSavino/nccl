@@ -13,6 +13,7 @@
 #include "rings.h"
 #include "topo.h"
 #include "bine.h"
+#include "bine_helper.h"
 #include "device/bine_utils.h"
 #include <vector>
 #include <sstream>
@@ -317,12 +318,26 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
       comm->channels[c].binePartner = comm->sharedBinePartner;
       comm->channels[c].bineIndex   = comm->sharedBineIndex;
       comm->channels[c].bineOrder   = comm->sharedBineOrder;
+
+      ncclBineBufferManagement_t bineBufMgmt;
+      bineBufMgmt = BLOCK_BY_BLOCK; // default
+
+      const char* str;
+      str = ncclGetEnv("NCCL_BINE_BUFFER_MANAGEMENT");
+      if (str == NULL) {
+        WARN("NCCL_BINE_BUFFER_MANAGEMENT not set, defaulting to BLOCK_BY_BLOCK");
+      }
+      else {
+        ncclBineBufferManagementFromString(str, &bineBufMgmt);
+      }
+
+      comm->channels[c].bine.bufferManagement = bineBufMgmt;
     }
 
     INFO(NCCL_GRAPH,
          "Bine: channel %d — "
          "host(send=%p recv=%p partner=%p index=%p order=%p) "
-         "dev(send=%p recv=%p partner=%p index=%p order=%p)",
+         "dev(send=%p recv=%p partner=%p index=%p order=%p bufferManagement=%s)",
          c,
          comm->channels[c].bineSend,
          comm->channels[c].bineRecv,
@@ -333,7 +348,8 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
          comm->channels[c].devBineRecv,
          comm->channels[c].devBinePartner,
          comm->channels[c].devBineIndex,
-         comm->channels[c].devBineOrder);
+         comm->channels[c].devBineOrder,
+         ncclBineBufferManagementToString(comm->channels[c].bine.bufferManagement));
   }
 
   // -------------------------------------------------------------------------

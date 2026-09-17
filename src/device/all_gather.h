@@ -94,16 +94,13 @@ namespace {
     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
                     &count, &gridOffset, &channelCount, &chunkCount);
 
-    if (channelCount == 0)
-      return;
-
     T *recvBuf = (T *)work->recvbuff;
     T *sendBuf = (T *)work->sendbuff;
     const int rank  = ncclShmem.comm.rank;
-    const int myIdx = bine->index[rank];
 
-    const int redistTo   = bine->index[rank]; // where my own chunk needs to end up
-    const int redistFrom = bine->order[rank]; // who owns the chunk that belongs at my slot
+    const int myIdx = bine->index[rank];
+    const int redistTo   = bine->order[rank]; // send my chunk to the rank owning virtual slot `rank`
+    const int redistFrom = myIdx; // == myIdx; recv from the rank whose real id == my virtual index
 
     const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
 
@@ -126,19 +123,20 @@ namespace {
       // (which always operate on the constructor's single output buffer).
       int sendPeer[1] = {redistTo};
       int recvPeer[1] = {redistFrom};
+
+      const ssize_t myOff   = (ssize_t)myIdx * count + gridOffset;
+      const ssize_t peerOff = (ssize_t)redistTo * count + gridOffset;
+
       if (useDirect) {
         Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
             tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-        // directSend needs (localInpIx, remoteOutIx, eltN) since input/output
-        // buffers differ here; remoteOutIx == gridOffset because chunking is
-        // identical across ranks for this channel.
-        prim.directSend(gridOffset, gridOffset, channelCount);
-        prim.directRecv(gridOffset, channelCount);
+        prim.directSend(gridOffset, peerOff, channelCount);
+        prim.directRecv(myOff, channelCount);
       } else {
         Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
             tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-        prim.send(gridOffset, channelCount);
-        prim.recv(gridOffset, channelCount);
+        prim.send(gridOffset, channelCount);   // unchanged: sendBuf is count-sized
+        prim.recv(myOff, channelCount);
       }
     }
     __syncthreads();
@@ -154,8 +152,9 @@ namespace {
       for (int s = 0; s < steps; ++s)
       {
         const int partner = bine->partners[rank * steps + s];
-        if (partner < 0)
+        if (partner < 0) {
           continue;
+        }
 
         const int span      = 1 << s;
         const int blockSize = span << 1;
@@ -190,6 +189,7 @@ namespace {
           for (int j = 0; j < span; ++j) {
             ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
             ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
+
             if (useDirect) {
               Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
               prim.directSendFromOutput(sOff, ne);
@@ -860,4 +860,4 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128
         break;
     }
   }
-}
+};

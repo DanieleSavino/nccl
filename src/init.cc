@@ -655,18 +655,6 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.comm.collNetDenseToUserRank, comm->collNetDenseToUserRank, nRanks, deviceStream), ret, fail);
   }
 
-  ncclBineBufferManagement_t bineBufMgmt;
-  bineBufMgmt = BLOCK_BY_BLOCK; // default
-
-  const char* str;
-  str = ncclGetEnv("NCCL_BINE_BUFFER_MANAGEMENT");
-  if (str == NULL) {
-    WARN("NCCL_BINE_BUFFER_MANAGEMENT not set, defaulting to BLOCK_BY_BLOCK");
-  }
-  else {
-    NCCLCHECKGOTO(ncclBineBufferManagementFromString(str, &bineBufMgmt), ret, fail);
-  }
-
   for (int c=0; c < MAXCHANNELS; c++) {
     tmpCommAndChans.channels[c].peers = comm->channels[c].devPeers;
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
@@ -682,7 +670,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.channels[c].bine.partners = comm->channels[c].devBinePartner;
     tmpCommAndChans.channels[c].bine.index = comm->channels[c].devBineIndex;
     tmpCommAndChans.channels[c].bine.order = comm->channels[c].devBineOrder;
-    tmpCommAndChans.channels[c].bine.bufferManagement = bineBufMgmt;
+    tmpCommAndChans.channels[c].bine.bufferManagement = comm->channels[c].bine.bufferManagement;
 
     if (comm->channels[c].ring.userRanks != nullptr) {
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].ring.userRanks, comm->channels[c].ring.userRanks, nRanks, deviceStream), ret, fail);
