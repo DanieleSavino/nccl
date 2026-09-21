@@ -2414,7 +2414,7 @@ static ncclResult_t calcCollChunking(
     const int doublingSteps = channel->bine.nDoublingSteps;
 
     const bool hasHalving = steps > 0 && channel->bineSend != nullptr && channel->bineRecv != nullptr;
-    const bool hasDoubling = doublingSteps > 0 && channel->binePartner != nullptr;
+    const bool hasDoubling = doublingSteps > 0 && (channel->binePartner != nullptr || channel->dhlvBinePartner != nullptr);
 
     const int nRanks = comm->nRanks;
     const int rank = comm->rank;
@@ -2443,21 +2443,31 @@ static ncclResult_t calcCollChunking(
       }
     }
 
-    const bool includeDoublingStage =
+  const bool includeDoublingStage =
         proxyOp->coll == ncclFuncAllReduce ||
         proxyOp->coll == ncclFuncAllGather ||
         proxyOp->coll == ncclFuncReduceScatter;
 
-    if (hasDoubling && includeDoublingStage && nRanks > 0)
+  if (hasDoubling && includeDoublingStage && nRanks > 0)
     {
       for (int step = 0; step < doublingSteps; ++step)
       {
-        int partner = channel->binePartner[rank * doublingSteps + step];
+        // Extract peers from the distance-doubling table (AllGather / BLOCK_BY_BLOCK)
+        if (channel->binePartner != nullptr) {
+          int partner = channel->binePartner[rank * doublingSteps + step];
+          if (partner >= 0 && partner != rank) {
+            sendPeers.push_back(partner);
+            recvPeers.push_back(partner);
+          }
+        }
 
-        if (partner >= 0 && partner != rank)
-        {
-          sendPeers.push_back(partner);
-          recvPeers.push_back(partner);
+        // Extract peers from the distance-halving table (DOUBLE_SEND ReduceScatter)
+        if (channel->dhlvBinePartner != nullptr) {
+          int partner = channel->dhlvBinePartner[rank * doublingSteps + step];
+          if (partner >= 0 && partner != rank) {
+            sendPeers.push_back(partner);
+            recvPeers.push_back(partner);
+          }
         }
       }
     }

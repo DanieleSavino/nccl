@@ -702,8 +702,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm,
           : 1;
 
   // ---- Halving phase: tree-style, exactly 1 send + 1 recv per step per peer.
-  // Unchanged from before — op->nsteps stays at the value calcCollChunking gave
-  // us.
+  // Unchanged from before — op->nsteps stays at the value calcCollChunking gave us.
   if (hasHalving) {
     std::vector<int> sendPeers;
     std::vector<int> recvPeers;
@@ -717,8 +716,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm,
          op->coll == ncclFuncAllReduce);
 
     int rootCount =
-        (op->coll == ncclFuncBroadcast || op->coll == ncclFuncReduce) ? 1
-                                                                      : nRanks;
+        (op->coll == ncclFuncBroadcast || op->coll == ncclFuncReduce) ? 1 : nRanks;
     for (int rIndex = 0; rIndex < rootCount; ++rIndex) {
       int root = (rootCount == 1) ? op->root : rIndex;
       if (root < 0 || root >= nRanks)
@@ -749,8 +747,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm,
     }
   }
 
-  // ---- Doubling phase: block-exchange. At step s, span = 2^s sends AND
-  // span recvs go to the SAME partner — one proxy op per step
+  // ---- Doubling phase: block-exchange.
   if (hasDoubling) {
     switch (buffMan) {
     case BLOCK_BY_BLOCK:
@@ -769,32 +766,77 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm,
       }
       break;
 
-    case SEND: {
-
-      const int redistTo = channel->bineOrder[rank];
-      const int redistFrom = channel->bineIndex[rank];
-      if (redistTo != rank) {
-        op->nsteps = nLoops * chunkSteps;
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, redistFrom, op, 0, justInquire));
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, redistTo, op, 0, justInquire));
-      }
+    case DOUBLE_SEND: {
       for (int step = 0; step < doublingSteps; ++step) {
-        int partner = channel->binePartner[rank * doublingSteps + step];
-        if (partner < 0 || partner == rank)
-          continue;
+        int partner = channel->dhlvBinePartner[rank * doublingSteps + step];
+        if (partner < 0 || partner == rank) continue;
 
-        const int span = 1 << step;
+        const int span = 1 << (doublingSteps - 1 - step);
         op->nsteps = span * nLoops * chunkSteps;
 
         NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
         NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
       }
+    }
+    break;
+
+    case SEND: {
+      const int orderRank = channel->bineOrder[rank];
+      const int indexRank = channel->bineIndex[rank];
+      
+      // ReduceScatter runs recursive halving (distance halves), while AllGather 
+      // runs recursive doubling (distance doubles). Their step orders differ.
+      const bool isRS = (op->coll == ncclFuncReduceScatter);
+
+      // 1. PRE-STEP (AllGather only)
+      // Send local block to orderRank, Recv local block from indexRank
+      if (!isRS && orderRank != rank) {
+        op->nsteps = nLoops * chunkSteps;
+        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, indexRank, op, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxySend, orderRank, op, 0, justInquire));
+      }
+
+      // 2. MAIN LOGARITHMIC STEPS
+      // The proxy MUST save the steps in the exact sequence the kernel executes them.
+      if (isRS) {
+        // ReduceScatter halves the span downwards: steps-1 to 0
+        for (int step = doublingSteps - 1; step >= 0; --step) {
+          int partner = channel->binePartner[rank * doublingSteps + step];
+          if (partner < 0 || partner == rank)
+            continue;
+
+          const int span = 1 << step;
+          op->nsteps = span * nLoops * chunkSteps;
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+        }
+      } else {
+        // AllGather doubles the span upwards: 0 to steps-1
+        for (int step = 0; step < doublingSteps; ++step) {
+          int partner = channel->binePartner[rank * doublingSteps + step];
+          if (partner < 0 || partner == rank)
+            continue;
+
+          const int span = 1 << step;
+          op->nsteps = span * nLoops * chunkSteps;
+          NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+        }
+      }
+
+      // 3. POST-STEP (ReduceScatter only)
+      // Send fully reduced block to indexRank, Recv fully reduced block from orderRank
+      if (isRS && orderRank != rank) {
+        op->nsteps = nLoops * chunkSteps;
+        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, orderRank, op, 0, justInquire));
+        NCCLCHECK(SaveProxy(comm, channel, proxySend, indexRank, op, 0, justInquire));
+      }
       break;
     }
 
     default:
-      // FIXME: [HLC] better handling of this.
       WARN("Buff management type not implemented");
+      return ncclInternalError;
     }
   }
 

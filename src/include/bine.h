@@ -9,6 +9,7 @@
 // Root=0 basis: fills sendTable/recvTable, each sized [nRanks * steps].
 void ncclGetBineTree(int nRanks, int steps, int *sendTable, int *recvTable);
 void ncclGetBineButterflyDdbl(int nRanks, int steps, int *partners, int *index, int *order);
+void ncclGetBineButterflyDhlv(int nRanks, int steps, int *partners);
 
 // Rotates a root=0 table to get the peer for arbitrary (root, rank, step).
 NCCL_HOST_DEVICE_INLINE int ncclBineTreeLookup(const int *virtualTable, int nRanks, int steps,

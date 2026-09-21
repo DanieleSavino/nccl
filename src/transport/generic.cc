@@ -111,7 +111,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     const int doublingSteps = channel->bine.nDoublingSteps;
 
     INFO(NCCL_INIT,
-         "BINE channel %d context steps %d doublingSteps %d bufferManagement %s host(send=%p recv=%p partner=%p index=%p order=%p) dev(send=%p recv=%p partner=%p index=%p order=%p)",
+         "BINE channel %d context steps %d doublingSteps %d bufferManagement %s host(send=%p recv=%p partner=%p dhlvPartner=%p index=%p order=%p) dev(send=%p recv=%p partner=%p dhlvPartner=%p index=%p order=%p)",
          c,
          steps,
          doublingSteps,
@@ -119,11 +119,13 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
          channel->bineSend,
          channel->bineRecv,
          channel->binePartner,
+         channel->dhlvBinePartner,
          channel->bineIndex,
          channel->bineOrder,
          channel->devBineSend,
          channel->devBineRecv,
          channel->devBinePartner,
+         channel->devDhlvBinePartner,
          channel->devBineIndex,
          channel->devBineOrder);
 
@@ -139,9 +141,10 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
         goto fail;
       }
     }
+    // Allow either doubling or halving tables to satisfy the table requirement check
     if (doublingSteps > 0) {
-      if (channel->binePartner == nullptr) {
-        WARN("BINE partner table is missing for channel %d", c);
+      if (channel->binePartner == nullptr && channel->dhlvBinePartner == nullptr) {
+        WARN("BINE partner tables (doubling and halving) are missing for channel %d", c);
         ret = ncclInternalError;
         goto fail;
       }
@@ -157,7 +160,8 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     };
 
     const bool hasStepTables = steps > 0 && channel->bineSend && channel->bineRecv;
-    const bool hasDoublingTables = doublingSteps > 0 && channel->binePartner;
+    const bool hasDoublingTables = doublingSteps > 0 && (channel->binePartner != nullptr || channel->dhlvBinePartner != nullptr);
+    
     if (steps > 0 && !hasStepTables) {
       WARN("BINE send/recv tables are missing for channel %d", c);
       ret = ncclInternalError;
@@ -281,31 +285,52 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       std::ostringstream doublingLog;
       bool hasDoublingComm = false;
 
-      // Pre-step (SEND/runBine only): one-time redistribution of this rank's
-      // own chunk into position-space slot before the doubling steps begin.
+      // For SEND buffer management, AllGather does a pre-step redistribution, 
+      // while ReduceScatter does a post-step redistribution. Since channel 
+      // connections are statically generated at init, we register both peers 
+      // bi-directionally to cover both collective topologies over this channel.
       if (buffMan == SEND) {
         const int redistTo   = channel->bineOrder[comm->rank];
         const int redistFrom = channel->bineIndex[comm->rank];
         if (redistTo != comm->rank) {
-          addPeer(redistTo,   /*sendToPeer=*/true,  /*recvFromPeer=*/false);
-          addPeer(redistFrom, /*sendToPeer=*/false, /*recvFromPeer=*/true);
-          doublingLog << "BINE channel " << c << " pre-step: send->" << redistTo
-                       << " recv<-" << redistFrom;
+          addPeer(redistTo,   /*sendToPeer=*/true, /*recvFromPeer=*/true);
+          addPeer(redistFrom, /*sendToPeer=*/true, /*recvFromPeer=*/true);
+          doublingLog << "BINE channel " << c << " pre/post-step: peer1=" << redistTo
+                      << " peer2=" << redistFrom;
           hasDoublingComm = true;
         }
       }
 
-      for (int step = 0; step < doublingSteps; ++step) {
-        const int partner = channel->binePartner[comm->rank * doublingSteps + step];
-        addPeer(partner, /*sendToPeer=*/true, /*recvFromPeer=*/true);
-        if (partner >= 0 && partner != comm->rank) {
-          if (!hasDoublingComm) {
-            doublingLog << "BINE channel " << c << " doubling steps:";
-            hasDoublingComm = true;
+      // Loop through distance-doubling steps (AllGather / BLOCK_BY_BLOCK)
+      if (channel->binePartner != nullptr) {
+        for (int step = 0; step < doublingSteps; ++step) {
+          const int partner = channel->binePartner[comm->rank * doublingSteps + step];
+          addPeer(partner, /*sendToPeer=*/true, /*recvFromPeer=*/true);
+          if (partner >= 0 && partner != comm->rank) {
+            if (!hasDoublingComm) {
+              doublingLog << "BINE channel " << c << " doubling steps:";
+              hasDoublingComm = true;
+            }
+            doublingLog << " D" << step << "[partner=" << partner << "]";
           }
-          doublingLog << " D" << step << "[partner=" << partner << "]";
         }
       }
+
+      // Loop through distance-halving steps (DOUBLE_SEND ReduceScatter)
+      if (channel->dhlvBinePartner != nullptr) {
+        for (int step = 0; step < doublingSteps; ++step) {
+          const int partner = channel->dhlvBinePartner[comm->rank * doublingSteps + step];
+          addPeer(partner, /*sendToPeer=*/true, /*recvFromPeer=*/true);
+          if (partner >= 0 && partner != comm->rank) {
+            if (!hasDoublingComm) {
+              doublingLog << "BINE channel " << c << " halving steps:";
+              hasDoublingComm = true;
+            }
+            doublingLog << " HLV" << step << "[partner=" << partner << "]";
+          }
+        }
+      }
+
       if (hasDoublingComm) {
         INFO(NCCL_INIT, "%s", doublingLog.str().c_str());
       }

@@ -202,6 +202,7 @@ struct ncclBine {
   int* send;
   int* recv;
   int* partners;
+  int* dhlvPartners;
   int* index;
   int* order;
   ncclBineBufferManagement_t bufferManagement;

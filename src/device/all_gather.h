@@ -84,127 +84,184 @@ namespace {
     if (isNetOffload) barrier_sync(14, nthreads);
   }
 
-  template <typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runBineSend(int tid, int nthreads, ncclDevWorkColl *work)
-  {
-    ncclBine *bine = &ncclShmem.channel.bine;
-    const int steps = bine->nDoublingSteps;
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBineSend(int tid, int nthreads, ncclDevWorkColl *work)
+{
+  ncclBine *bine = &ncclShmem.channel.bine;
+  const int steps = bine->nDoublingSteps;
 
-    ssize_t count, gridOffset, channelCount, chunkCount;
-    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
-                    &count, &gridOffset, &channelCount, &chunkCount);
+  ssize_t count, gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                  &count, &gridOffset, &channelCount, &chunkCount);
 
-    T *recvBuf = (T *)work->recvbuff;
-    T *sendBuf = (T *)work->sendbuff;
-    const int rank  = ncclShmem.comm.rank;
+  T *recvBuf = (T *)work->recvbuff;
+  T *sendBuf = (T *)work->sendbuff;
+  const int rank  = ncclShmem.comm.rank;
+  const int nRanks = ncclShmem.comm.nRanks;
 
-    const int myIdx = bine->index[rank];
-    const int redistTo   = bine->order[rank]; // send my chunk to the rank owning virtual slot `rank`
-    const int redistFrom = myIdx; // == myIdx; recv from the rank whose real id == my virtual index
+  const int myIdx = bine->index[rank];
+  const int redistTo   = bine->order[rank];
+  const int redistFrom = myIdx;
 
-    const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+  const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
 
-    T *mySeg = recvBuf + (ssize_t)rank * count;
+  // Bound of the whole recv buffer in elements -- anything we compute as an
+  // offset into recvBuf must land strictly below this.
+  const ssize_t bufElems = (ssize_t)nRanks * count;
 
-    // --- Pre-step: redistribute just the OWN (count-sized) contribution so
-    // that, afterwards, buffer slot `rank` holds exactly what position-space
-    // expects to find there. This is the one-time cost that lets every
-    // subsequent doubling step use raw contiguous addressing with zero
-    // order[]/index[] lookups and a single bulk primitive call.
-    if (redistTo == rank) {
-      // I'm a fixed point of the permutation: plain local copy, as before.
-      if (sendBuf != mySeg) {
-        for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
-          mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
-      }
-    } else {
-      // Genuine cross-rank move: src (sendBuf) != dst (recvBuf), so this must
-      // use the plain send/recv primitives, NOT the *FromOutput variants
-      // (which always operate on the constructor's single output buffer).
-      int sendPeer[1] = {redistTo};
-      int recvPeer[1] = {redistFrom};
+  if (tid == 0) {
+    printf("[BINE rank=%d ch=%d] ENTER count=%lld gridOffset=%lld channelCount=%lld chunkCount=%lld "
+           "steps=%d nRanks=%d myIdx=%d redistTo=%d redistFrom=%d useDirect=%d bufElems=%lld\n",
+           rank, ncclShmem.channelId, (long long)count, (long long)gridOffset,
+           (long long)channelCount, (long long)chunkCount, steps, nRanks,
+           myIdx, redistTo, redistFrom, (int)useDirect, (long long)bufElems);
+  }
 
-      const ssize_t myOff   = (ssize_t)myIdx * count + gridOffset;
-      const ssize_t peerOff = (ssize_t)redistTo * count + gridOffset;
+  T *mySeg = recvBuf + (ssize_t)rank * count;
 
-      if (useDirect) {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-        prim.directSend(gridOffset, peerOff, channelCount);
-        prim.directRecv(myOff, channelCount);
-      } else {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-        prim.send(gridOffset, channelCount);   // unchanged: sendBuf is count-sized
-        prim.recv(myOff, channelCount);
-      }
+  if (redistTo == rank) {
+    if (sendBuf != mySeg) {
+      for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
+        mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
     }
-    __syncthreads();
+  } else {
+    int sendPeer[1] = {redistTo};
+    int recvPeer[1] = {redistFrom};
 
-    // --- Main doubling steps: pure position-space addressing (myIdx-based),
-    // no order[] indirection, one bulk send/recv per step instead of a
-    // span-sized loop of tiny messages.
-    for (ssize_t elem = 0; elem < channelCount; elem += chunkCount)
+    const ssize_t myOff   = (ssize_t)myIdx * count + gridOffset;
+    const ssize_t peerOff = (ssize_t)redistTo * count + gridOffset;
+
+    if (tid == 0) {
+      printf("[BINE rank=%d ch=%d] PRE-STEP sendPeer=%d recvPeer=%d myOff=%lld peerOff=%lld "
+             "channelCount=%lld myOff_end=%lld peerOff_end=%lld bufElems=%lld %s%s\n",
+             rank, ncclShmem.channelId, sendPeer[0], recvPeer[0],
+             (long long)myOff, (long long)peerOff, (long long)channelCount,
+             (long long)(myOff + channelCount), (long long)(peerOff + channelCount),
+             (long long)bufElems,
+             (myOff + channelCount > bufElems) ? " <-- MYOFF OOB!" : "",
+             (peerOff + channelCount > bufElems) ? " <-- PEEROFF OOB!" : "");
+    }
+
+    if (useDirect) {
+      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
+          tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+      prim.directSend(gridOffset, peerOff, channelCount);
+      prim.directRecv(myOff, channelCount);
+    } else {
+      Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
+          tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+      prim.send(gridOffset, channelCount);
+      prim.recv(myOff, channelCount);
+    }
+
+    if (tid == 0) {
+      printf("[BINE rank=%d ch=%d] PRE-STEP DONE\n", rank, ncclShmem.channelId);
+    }
+  }
+  __syncthreads();
+
+  for (ssize_t elem = 0; elem < channelCount; elem += chunkCount)
+  {
+    const ssize_t dataOff = gridOffset + elem;
+    const int ne = (int)min(chunkCount, channelCount - elem);
+
+    for (int s = 0; s < steps; ++s)
     {
-      const ssize_t dataOff = gridOffset + elem;
-      const int ne = (int)min(chunkCount, channelCount - elem);
+      const int partner = bine->partners[rank * steps + s];
+      if (partner < 0) {
+        if (tid == 0) {
+          printf("[BINE rank=%d ch=%d] elem=%lld s=%d SKIPPED partner<0\n",
+                 rank, ncclShmem.channelId, (long long)elem, s);
+        }
+        continue;
+      }
 
-      for (int s = 0; s < steps; ++s)
-      {
-        const int partner = bine->partners[rank * steps + s];
-        if (partner < 0) {
-          continue;
+      const int span      = 1 << s;
+      const int blockSize = span << 1;
+      const int base      = (myIdx / blockSize) * blockSize;
+      const bool keepLower = ((myIdx >> s) & 1) == 0;
+
+      const int sendBeg = keepLower ? base : base + span;
+      const int recvBeg = keepLower ? base + span : base;
+
+      int peers[1] = {partner};
+
+      if (ne == (int)count) {
+        const ssize_t sendOff  = (ssize_t)sendBeg * count + dataOff - gridOffset;
+        const ssize_t recvOff  = (ssize_t)recvBeg * count + dataOff - gridOffset;
+        const ssize_t nElemStep = (ssize_t)span * count;
+
+        if (tid == 0) {
+          printf("[BINE rank=%d ch=%d] elem=%lld s=%d FASTPATH partner=%d myIdx=%d base=%d span=%d "
+                 "sendBeg=%d recvBeg=%d sendOff=%lld sendOff_end=%lld recvOff=%lld recvOff_end=%lld "
+                 "bufElems=%lld %s%s\n",
+                 rank, ncclShmem.channelId, (long long)elem, s, partner, myIdx, base, span,
+                 sendBeg, recvBeg, (long long)sendOff, (long long)(sendOff + nElemStep),
+                 (long long)recvOff, (long long)(recvOff + nElemStep), (long long)bufElems,
+                 (sendOff + nElemStep > bufElems) ? " <-- SENDOFF OOB!" : "",
+                 (recvOff + nElemStep > bufElems) ? " <-- RECVOFF OOB!" : "");
         }
 
-        const int span      = 1 << s;
-        const int blockSize = span << 1;
-        const int base      = (myIdx / blockSize) * blockSize;
-        const bool keepLower = ((myIdx >> s) & 1) == 0;
+        if (useDirect) {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+          prim.directSendFromOutput(sendOff, nElemStep);
+          prim.directRecv(recvOff, nElemStep);
+        } else {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+          prim.sendFromOutput(sendOff, nElemStep);
+          prim.recv(recvOff, nElemStep);
+        }
 
-        const int sendBeg = keepLower ? base : base + span;
-        const int recvBeg = keepLower ? base + span : base;
+        if (tid == 0) {
+          printf("[BINE rank=%d ch=%d] elem=%lld s=%d FASTPATH DONE\n",
+                 rank, ncclShmem.channelId, (long long)elem, s);
+        }
+      } else {
+        if (tid == 0) {
+          printf("[BINE rank=%d ch=%d] elem=%lld s=%d SLOWPATH ENTER partner=%d myIdx=%d base=%d span=%d "
+                 "sendBeg=%d recvBeg=%d ne=%d count=%lld dataOff=%lld\n",
+                 rank, ncclShmem.channelId, (long long)elem, s, partner, myIdx, base, span,
+                 sendBeg, recvBeg, ne, (long long)count, (long long)dataOff);
+        }
 
-        int peers[1] = {partner};
+        for (int j = 0; j < span; ++j) {
+          ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
+          ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
 
-        if (ne == (int)count) {
-          // Fast path: whole blocks in range -> truly contiguous, one call.
-          const ssize_t sendOff  = (ssize_t)sendBeg * count + dataOff - gridOffset; // == sendBeg*count + elem
-          const ssize_t recvOff  = (ssize_t)recvBeg * count + dataOff - gridOffset;
-          const ssize_t nElemStep = (ssize_t)span * count;
+          if (tid == 0) {
+            printf("[BINE rank=%d ch=%d] elem=%lld s=%d j=%d SLOWPATH sOff=%lld sOff_end=%lld "
+                   "rOff=%lld rOff_end=%lld ne=%d bufElems=%lld %s%s\n",
+                   rank, ncclShmem.channelId, (long long)elem, s, j,
+                   (long long)sOff, (long long)(sOff + ne), (long long)rOff, (long long)(rOff + ne),
+                   ne, (long long)bufElems,
+                   (sOff + ne > bufElems) ? " <-- SOFF OOB!" : "",
+                   (rOff + ne > bufElems) ? " <-- ROFF OOB!" : "");
+          }
 
           if (useDirect) {
             Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-            prim.directSendFromOutput(sendOff, nElemStep);
-            prim.directRecv(recvOff, nElemStep);
+            prim.directSendFromOutput(sOff, ne);
+            prim.directRecv(rOff, ne);
           } else {
             Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-            prim.sendFromOutput(sendOff, nElemStep);
-            prim.recv(recvOff, nElemStep);
+            prim.sendFromOutput(sOff, ne);
+            prim.recv(rOff, ne);
           }
-        } else {
-          // channelCount is pipelined into sub-chunks smaller than a full
-          // block: a span of blocks is no longer one contiguous memory
-          // region at this granularity, so fall back to per-block calls
-          // for correctness.
-          for (int j = 0; j < span; ++j) {
-            ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
-            ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
 
-            if (useDirect) {
-              Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-              prim.directSendFromOutput(sOff, ne);
-              prim.directRecv(rOff, ne);
-            } else {
-              Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-              prim.sendFromOutput(sOff, ne);
-              prim.recv(rOff, ne);
-            }
+          if (tid == 0) {
+            printf("[BINE rank=%d ch=%d] elem=%lld s=%d j=%d SLOWPATH DONE\n",
+                   rank, ncclShmem.channelId, (long long)elem, s, j);
           }
         }
       }
-      __syncthreads(); // steps must serialize: step s+1 depends on data landed in step s
     }
+    __syncthreads();
   }
+
+  if (tid == 0) {
+    printf("[BINE rank=%d ch=%d] EXIT\n", rank, ncclShmem.channelId);
+  }
+}
 
   template <typename T, typename RedOp, typename Proto>
   __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads, ncclDevWorkColl *work)
@@ -775,7 +832,6 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_P
   }
 };
 
-// FIXME: [HLC] Temp, expose Buff Modes to user eventually.
 template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE>
 {

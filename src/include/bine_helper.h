@@ -6,6 +6,13 @@
 #include <string.h>
 #include <algorithm>
 
+#pragma once
+#ifdef __CUDACC__
+#define BINE_HD __host__ __device__ __forceinline__
+#else
+#define BINE_HD inline
+#endif
+
 typedef enum {
   BLOCK_BY_BLOCK,
   PERMUTATION,
@@ -54,5 +61,6 @@ static int bineNstepsPerLoop(ncclFunc_t coll, int halvingSteps, int doublingStep
     return std::max(halvingSteps, doublingSteps);
   }
 }
+
 
 #endif // BINE_HELPER_H_

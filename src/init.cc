@@ -668,6 +668,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.channels[c].bine.send = comm->channels[c].devBineSend;
     tmpCommAndChans.channels[c].bine.recv = comm->channels[c].devBineRecv;
     tmpCommAndChans.channels[c].bine.partners = comm->channels[c].devBinePartner;
+    tmpCommAndChans.channels[c].bine.dhlvPartners = comm->channels[c].devDhlvBinePartner;
     tmpCommAndChans.channels[c].bine.index = comm->channels[c].devBineIndex;
     tmpCommAndChans.channels[c].bine.order = comm->channels[c].devBineOrder;
     tmpCommAndChans.channels[c].bine.bufferManagement = comm->channels[c].bine.bufferManagement;
@@ -692,6 +693,13 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     {
       size_t doublingElems = (size_t)comm->channels[c].bine.nDoublingSteps * nRanks;
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.partners, comm->channels[c].binePartner, doublingElems, deviceStream), ret, fail);
+    }
+
+    if (comm->channels[c].bine.nDoublingSteps > 0 &&
+        comm->channels[c].dhlvBinePartner != nullptr && comm->channels[c].devDhlvBinePartner != nullptr)
+    {
+      size_t halvingElems = (size_t)comm->channels[c].bine.nDoublingSteps * nRanks;
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dhlvPartners, comm->channels[c].dhlvBinePartner, halvingElems, deviceStream), ret, fail);
     }
 
     // 3. Handle Index and Order
@@ -1696,6 +1704,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       WARN("Bine: sharedBinePartner already allocated at %p — reusing existing buffer", comm->sharedBinePartner);
     }
 
+    if (comm->sharedBineDhlvPartner == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineDhlvPartner, doublingElems), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedBineDhlvPartner already allocated at %p — reusing existing buffer", comm->sharedBineDhlvPartner);
+    }
+
     if (comm->sharedBineIndex == nullptr)
     {
       NCCLCHECKGOTO(ncclCalloc(&comm->sharedBineIndex, mapElems), ret, fail);
@@ -1744,6 +1761,15 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     else
     {
       WARN("Bine: sharedDevBinePartner already allocated at %p — reusing existing device buffer", comm->sharedDevBinePartner);
+    }
+
+    if (comm->sharedDevDhlvBinePartner == nullptr)
+    {
+      NCCLCHECKGOTO(ncclCudaCalloc((char **)&comm->sharedDevDhlvBinePartner, halvingElems, comm->memManager), ret, fail);
+    }
+    else
+    {
+      WARN("Bine: sharedDevDhlvBinePartner already allocated at %p — reusing existing device buffer", comm->sharedDevDhlvBinePartner);
     }
 
     if (comm->sharedDevBineIndex == nullptr)

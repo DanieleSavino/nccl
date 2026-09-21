@@ -258,6 +258,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   const bool haveSharedBineBuffers =
       comm->sharedBineSend    != nullptr &&
       comm->sharedBineRecv    != nullptr &&
+      comm->sharedBineDhlvPartner != nullptr &&
       comm->sharedBinePartner != nullptr &&
       comm->sharedBineIndex   != nullptr &&
       comm->sharedBineOrder   != nullptr;
@@ -273,10 +274,11 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   {
     INFO(NCCL_GRAPH,
          "Bine: shared host buffers not allocated "
-         "(send=%p recv=%p partner=%p index=%p order=%p) — disabling Bine on all channels",
+         "(send=%p recv=%p partner=%p dhlvPartner=%p index=%p order=%p) — disabling Bine on all channels",
          comm->sharedBineSend,
          comm->sharedBineRecv,
          comm->sharedBinePartner,
+         comm->sharedBineDhlvPartner,
          comm->sharedBineIndex,
          comm->sharedBineOrder);
 
@@ -287,6 +289,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
       comm->channels[c].bine.send          = nullptr;
       comm->channels[c].bine.recv          = nullptr;
       comm->channels[c].bine.partners      = nullptr;
+      comm->channels[c].bine.dhlvPartners  = nullptr;
       comm->channels[c].bine.index         = nullptr;
       comm->channels[c].bine.order         = nullptr;
     }
@@ -309,6 +312,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
       comm->channels[c].bine.send     = comm->sharedDevBineSend;
       comm->channels[c].bine.recv     = comm->sharedDevBineRecv;
       comm->channels[c].bine.partners = comm->sharedDevBinePartner;
+      comm->channels[c].bine.dhlvPartners = comm->sharedDevDhlvBinePartner;
       comm->channels[c].bine.index    = comm->sharedDevBineIndex;
       comm->channels[c].bine.order    = comm->sharedDevBineOrder;
 
@@ -316,6 +320,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
       comm->channels[c].bineSend    = comm->sharedBineSend;
       comm->channels[c].bineRecv    = comm->sharedBineRecv;
       comm->channels[c].binePartner = comm->sharedBinePartner;
+      comm->channels[c].dhlvBinePartner = comm->sharedBineDhlvPartner;
       comm->channels[c].bineIndex   = comm->sharedBineIndex;
       comm->channels[c].bineOrder   = comm->sharedBineOrder;
 
@@ -336,12 +341,13 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
 
     INFO(NCCL_GRAPH,
          "Bine: channel %d — "
-         "host(send=%p recv=%p partner=%p index=%p order=%p) "
+         "host(send=%p recv=%p partner=%p dhlvPartner=%p index=%p order=%p) "
          "dev(send=%p recv=%p partner=%p index=%p order=%p bufferManagement=%s)",
          c,
          comm->channels[c].bineSend,
          comm->channels[c].bineRecv,
          comm->channels[c].binePartner,
+         comm->channels[c].dhlvBinePartner,
          comm->channels[c].bineIndex,
          comm->channels[c].bineOrder,
          comm->channels[c].devBineSend,
@@ -387,10 +393,12 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   // -------------------------------------------------------------------------
   const size_t halvingTableElems  = (size_t)nRanks * steps;
   const size_t doublingTableElems = (size_t)nRanks * steps;
+  const size_t doublingBTableElems = (size_t)nRanks * steps;
 
   std::vector<int> sendTable(halvingTableElems,  -1);
   std::vector<int> recvTable(halvingTableElems,  -1);
   std::vector<int> partnerTable(doublingTableElems, -1);
+  std::vector<int> partnerDhlvTable(doublingBTableElems, -1);
   std::vector<int> indexMap(nRanks, 0);
   std::vector<int> orderMap(nRanks, 0);
 
@@ -404,6 +412,9 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
                       partnerTable.data(),
                       indexMap.data(),
                       orderMap.data());
+
+  ncclGetBineButterflyDhlv(nRanks, steps,
+                      partnerDhlvTable.data());
 
   // -------------------------------------------------------------------------
   // Diagnostic: log the first few entries of each schedule row for this rank.
@@ -434,6 +445,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   logScheduleRow("send schedule",    sendTable,    myHalvingOffset,  steps);
   logScheduleRow("recv schedule",    recvTable,    myHalvingOffset,  steps);
   logScheduleRow("partner schedule", partnerTable, myDoublingOffset, steps);
+  logScheduleRow("dhlv partner schedule", partnerTable, myDoublingOffset, steps);
 
   // -------------------------------------------------------------------------
   // Copy the completed host-side tables into the shared host buffers.
@@ -442,6 +454,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
   memcpy(comm->sharedBineSend,    sendTable.data(),    halvingTableElems  * sizeof(int));
   memcpy(comm->sharedBineRecv,    recvTable.data(),    halvingTableElems  * sizeof(int));
   memcpy(comm->sharedBinePartner, partnerTable.data(), doublingTableElems * sizeof(int));
+  memcpy(comm->sharedBineDhlvPartner, partnerDhlvTable.data(), doublingTableElems * sizeof(int));
   memcpy(comm->sharedBineIndex,   indexMap.data(),     nRanks             * sizeof(int));
   memcpy(comm->sharedBineOrder,   orderMap.data(),     nRanks             * sizeof(int));
 

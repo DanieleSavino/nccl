@@ -169,3 +169,39 @@ void ncclGetBineButterflyDdbl(int nRanks, int steps, int *partners, int *index, 
     }
   }
 }
+
+// ------------------------------------------------------------
+// HALVING schedule builder (for DOUBLE_SEND ReduceScatter)
+// ------------------------------------------------------------
+void ncclGetBineButterflyDhlv(int nRanks, int steps, int *partners)
+{
+  if (nRanks <= 0 || !partners)
+    return;
+  
+  const size_t elems = (size_t)nRanks * steps;
+  std::fill(partners, partners + elems, -1);
+
+  // Build the partner table using Equation 4 from the SC'25 Bine paper.
+  for (int step = 0; step < steps; ++step)
+  {
+    // Calculate the distance sum: \sum_{j=0}^{s-i-1} (-2)^j
+    int distance = 0;
+    const int limit = steps - step - 1;
+    for (int j = 0; j <= limit; ++j) {
+      distance += (j % 2 == 0) ? (1 << j) : -(1 << j);
+    }
+
+    for (int r = 0; r < nRanks; ++r)
+    {
+      int q = (r % 2 == 0) ? (r - distance) : (r + distance);
+      
+      // Handle modulo arithmetic for negative values
+      q %= nRanks;
+      if (q < 0) {
+        q += nRanks;
+      }
+      
+      partners[r * steps + step] = q;
+    }
+  }
+}
