@@ -12,6 +12,7 @@
 #include "bootstrap.h"
 #include "channel.h"
 #include "cudawrap.h"
+#include "include/bine_helper.h"
 #include "profiler.h"
 #include "transport.h"
 #include "register_inline.h"
@@ -2106,25 +2107,9 @@ static ncclResult_t calcCollChunking(
   ncclPattern_t pattern;
   size_t grainSize = ncclProtoGrainSize(info->protocol);
 
-  auto computeBineStages = [&]() {
-    const int halvingSteps = comm->channels[0].bine.nSteps;
-    const int doublingSteps = comm->channels[0].bine.nDoublingSteps;
-    switch (info->func)
-    {
-    case ncclFuncReduce:
-    case ncclFuncBroadcast:
-      return halvingSteps;
-    case ncclFuncReduceScatter:
-    case ncclFuncAllGather:
-      return doublingSteps;
-    case ncclFuncAllReduce:
-      return halvingSteps + doublingSteps;
-    default:
-      return std::max(halvingSteps, doublingSteps);
-    }
-  };
-
-  const int bineStages = info->algorithm == NCCL_ALGO_BINE ? computeBineStages() : 0;
+  const int halvingSteps = comm->channels[0].bine.nSteps;
+  const int doublingSteps = comm->channels[0].bine.nDoublingSteps;
+  const int bineStages = info->algorithm == NCCL_ALGO_BINE ? bineNstepsPerLoop(info->func, halvingSteps, doublingSteps) : 0;
 
   auto computeChunksPerChannel = [&](int size) -> int {
     return size > 0 ? (int)DIVUP(nBytes, (size_t)nChannels * (size_t)size) : 0;
@@ -2177,8 +2162,9 @@ static ncclResult_t calcCollChunking(
   int nstepsPerLoop, nchunksPerLoop;
   size_t loopOffset = 0;
   int stepSize   = comm->buffSizes[info->protocol]/NCCL_STEPS;
-  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->chunkSteps : 1;
-  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && info->algorithm == NCCL_ALGO_RING) ? info->sliceSteps : 1;
+  // INFO: [HLC] Bine uses same chunkSteps and sliceSteps as ring.
+  int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->chunkSteps : 1;
+  int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->sliceSteps : 1;
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
@@ -2367,9 +2353,9 @@ static ncclResult_t calcCollChunking(
         proxyOp->nsteps = DIVUP(nBytes, proxyOp->loopSize) * nstepsPerLoop;
         proxyOp->loopOffset = 0;
       }
-    }
-    else if (info->algorithm == NCCL_ALGO_BINE) {
-      // Skip
+    } else if (info->algorithm == NCCL_ALGO_BINE) {
+      proxyOp->nsteps = DIVUP(nBytes, proxyOp->loopSize) * nstepsPerLoop;
+      proxyOp->loopOffset = 0;
     }
     else {
       WARN("Net registration invalid algorithm %s", ncclAlgoToString(info->algorithm));
@@ -2428,7 +2414,7 @@ static ncclResult_t calcCollChunking(
     const int doublingSteps = channel->bine.nDoublingSteps;
 
     const bool hasHalving = steps > 0 && channel->bineSend != nullptr && channel->bineRecv != nullptr;
-    const bool hasDoubling = doublingSteps > 0 && channel->binePartner != nullptr;
+    const bool hasDoubling = doublingSteps > 0 && (channel->binePartner != nullptr || channel->dhlvBinePartner != nullptr);
 
     const int nRanks = comm->nRanks;
     const int rank = comm->rank;
@@ -2457,21 +2443,31 @@ static ncclResult_t calcCollChunking(
       }
     }
 
-    const bool includeDoublingStage =
+  const bool includeDoublingStage =
         proxyOp->coll == ncclFuncAllReduce ||
         proxyOp->coll == ncclFuncAllGather ||
         proxyOp->coll == ncclFuncReduceScatter;
 
-    if (hasDoubling && includeDoublingStage && nRanks > 0)
+  if (hasDoubling && includeDoublingStage && nRanks > 0)
     {
       for (int step = 0; step < doublingSteps; ++step)
       {
-        int partner = channel->binePartner[rank * doublingSteps + step];
+        // Extract peers from the distance-doubling table (AllGather / BLOCK_BY_BLOCK)
+        if (channel->binePartner != nullptr) {
+          int partner = channel->binePartner[rank * doublingSteps + step];
+          if (partner >= 0 && partner != rank) {
+            sendPeers.push_back(partner);
+            recvPeers.push_back(partner);
+          }
+        }
 
-        if (partner >= 0 && partner != rank)
-        {
-          sendPeers.push_back(partner);
-          recvPeers.push_back(partner);
+        // Extract peers from the distance-halving table (DOUBLE_SEND ReduceScatter)
+        if (channel->dhlvBinePartner != nullptr) {
+          int partner = channel->dhlvBinePartner[rank * doublingSteps + step];
+          if (partner >= 0 && partner != rank) {
+            sendPeers.push_back(partner);
+            recvPeers.push_back(partner);
+          }
         }
       }
     }

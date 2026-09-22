@@ -8,6 +8,7 @@
 #include "device.h"
 #include "collectives.h"
 #include "primitives.h"
+#include <cstdio>
 
 namespace {
   template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
@@ -83,9 +84,118 @@ namespace {
     if (isNetOffload) barrier_sync(14, nthreads);
   }
 
-// INFO:  [HLC] Added Bine allgather implementation.
   template <typename T, typename RedOp, typename Proto>
-  __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work)
+  __device__ __forceinline__ void runBineSend(int tid, int nthreads, ncclDevWorkColl *work)
+  {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const int steps = bine->nDoublingSteps;
+
+    ssize_t count, gridOffset, channelCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                    &count, &gridOffset, &channelCount, &chunkCount);
+
+    T *recvBuf = (T *)work->recvbuff;
+    T *sendBuf = (T *)work->sendbuff;
+    const int rank  = ncclShmem.comm.rank;
+    const int nRanks = ncclShmem.comm.nRanks;
+
+    const int myIdx = bine->index[rank];
+    const int redistTo   = bine->order[rank];
+    const int redistFrom = myIdx;
+
+    const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+    // Bound of the whole recv buffer in elements -- anything we compute as an
+    // offset into recvBuf must land strictly below this.
+    const ssize_t bufElems = (ssize_t)nRanks * count;
+
+    T *mySeg = recvBuf + (ssize_t)rank * count;
+
+    if (redistTo == rank) {
+      if (sendBuf != mySeg) {
+        for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
+          mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
+      }
+    } else {
+      int sendPeer[1] = {redistTo};
+      int recvPeer[1] = {redistFrom};
+
+      const ssize_t myOff   = (ssize_t)myIdx * count + gridOffset;
+      const ssize_t peerOff = (ssize_t)redistTo * count + gridOffset;
+
+      if (useDirect) {
+        Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
+            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+        prim.directSend(gridOffset, peerOff, channelCount);
+        prim.directRecv(myOff, channelCount);
+      } else {
+        Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
+            tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
+        prim.send(gridOffset, channelCount);
+        prim.recv(myOff, channelCount);
+      }
+    }
+    __syncthreads();
+
+    for (ssize_t elem = 0; elem < channelCount; elem += chunkCount)
+    {
+      const ssize_t dataOff = gridOffset + elem;
+      const int ne = (int)min(chunkCount, channelCount - elem);
+
+      for (int s = 0; s < steps; ++s)
+      {
+        const int partner = bine->partners[rank * steps + s];
+        if (partner < 0) {
+          continue;
+        }
+
+        const int span      = 1 << s;
+        const int blockSize = span << 1;
+        const int base      = (myIdx / blockSize) * blockSize;
+        const bool keepLower = ((myIdx >> s) & 1) == 0;
+
+        const int sendBeg = keepLower ? base : base + span;
+        const int recvBeg = keepLower ? base + span : base;
+
+        int peers[1] = {partner};
+
+        if (ne == (int)count) {
+          const ssize_t sendOff  = (ssize_t)sendBeg * count + dataOff - gridOffset;
+          const ssize_t recvOff  = (ssize_t)recvBeg * count + dataOff - gridOffset;
+          const ssize_t nElemStep = (ssize_t)span * count;
+
+          if (useDirect) {
+            Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+            prim.directSendFromOutput(sendOff, nElemStep);
+            prim.directRecv(recvOff, nElemStep);
+          } else {
+            Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+            prim.sendFromOutput(sendOff, nElemStep);
+            prim.recv(recvOff, nElemStep);
+          }
+        } else {
+          for (int j = 0; j < span; ++j) {
+            ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
+            ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
+
+            if (useDirect) {
+              Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+              prim.directSendFromOutput(sOff, ne);
+              prim.directRecv(rOff, ne);
+            } else {
+              Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+              prim.sendFromOutput(sOff, ne);
+              prim.recv(rOff, ne);
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  template <typename T, typename RedOp, typename Proto>
+  __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads, ncclDevWorkColl *work)
   {
     ncclBine *bine = &ncclShmem.channel.bine;
     const int steps = bine->nDoublingSteps;
@@ -658,8 +768,28 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPL
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
     using Proto = ProtoSimple<ALLGATHER_CHUNKSTEPS / ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>;
-    runBine<T, RedOp, Proto>(tid, nthreads, work);
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, Proto>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
 };
 
@@ -668,7 +798,26 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL>
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBine<T, RedOp, ProtoLL>(tid, nthreads, work);
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, ProtoLL>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
 };
 
@@ -677,6 +826,25 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128
 {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
   {
-    runBine<T, RedOp, ProtoLL128>(tid, nthreads, work);
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    switch (bufferManagement) {
+      case BLOCK_BY_BLOCK:
+        runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
+        break;
+      // case PERMUTATION:
+      //   runBinePermutation<T, RedOp, ProtoLL128>(tid, nthreads, work);
+      //   break;
+      // case DOUBLE_SEND:
+      //   runBineDoubleSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+      //   break;
+      case SEND:
+        runBineSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+        break;
+      default:
+        assert(false && "Invalid Bine buffer management");
+        break;
+    }
   }
 };

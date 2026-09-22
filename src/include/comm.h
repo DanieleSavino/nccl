@@ -162,9 +162,11 @@ struct ncclChannel {
   int* devBineSend;
   int* devBineRecv;
   int* binePartner;
+  int* dhlvBinePartner;
   int* bineIndex;
   int* bineOrder;
   int* devBinePartner;
+  int* devDhlvBinePartner;
   int* devBineIndex;
   int* devBineOrder;
   struct ncclBine bine;
@@ -556,11 +558,13 @@ struct ncclComm {
   int* sharedBineSend;
   int* sharedBineRecv;
   int* sharedBinePartner;
+  int* sharedBineDhlvPartner;
   int* sharedBineIndex;
   int* sharedBineOrder;
   int* sharedDevBineSend;
   int* sharedDevBineRecv;
   int* sharedDevBinePartner;
+  int* sharedDevDhlvBinePartner;
   int* sharedDevBineIndex;
   int* sharedDevBineOrder;
 

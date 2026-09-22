@@ -8,6 +8,7 @@
 #ifndef NCCL_DEVICE_H_
 #define NCCL_DEVICE_H_
 
+#include "bine_helper.h"
 #include "nccl.h"
 #include "nccl_device/core.h"
 #include "nccl_tuner.h"
@@ -201,8 +202,10 @@ struct ncclBine {
   int* send;
   int* recv;
   int* partners;
+  int* dhlvPartners;
   int* index;
   int* order;
+  ncclBineBufferManagement_t bufferManagement;
 };
 
 #define NCCL_MAX_DIRECT_ARITY 7

@@ -67,16 +67,19 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   channel->bine.send = nullptr;
   channel->bine.recv = nullptr;
   channel->bine.partners = nullptr;
+  channel->bine.dhlvPartners = nullptr;
   channel->bine.index = nullptr;
   channel->bine.order = nullptr;
   channel->bineSend = nullptr;
   channel->bineRecv = nullptr;
   channel->binePartner = nullptr;
+  channel->dhlvBinePartner = nullptr;
   channel->bineIndex = nullptr;
   channel->bineOrder = nullptr;
   channel->devBineSend = nullptr;
   channel->devBineRecv = nullptr;
   channel->devBinePartner = nullptr;
+  channel->devDhlvBinePartner = nullptr;
   channel->devBineIndex = nullptr;
   channel->devBineOrder = nullptr;
   if (bineSteps > 0) {
@@ -86,12 +89,14 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
       comm->sharedBineSend = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingElems);
       comm->sharedBineRecv = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingElems);
       comm->sharedBinePartner = ncclMemoryStackAlloc<int>(&comm->memPermanent, doublingElems);
+      comm->sharedBineDhlvPartner = ncclMemoryStackAlloc<int>(&comm->memPermanent, doublingElems);
       comm->sharedBineIndex = ncclMemoryStackAlloc<int>(&comm->memPermanent, nRanks);
       comm->sharedBineOrder = ncclMemoryStackAlloc<int>(&comm->memPermanent, nRanks);
     }
     channel->bineSend = comm->sharedBineSend;
     channel->bineRecv = comm->sharedBineRecv;
     channel->binePartner = comm->sharedBinePartner;
+    channel->dhlvBinePartner = comm->sharedBineDhlvPartner;
     channel->bineIndex = comm->sharedBineIndex;
     channel->bineOrder = comm->sharedBineOrder;
 
@@ -99,17 +104,20 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
       NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineSend,    halvingElems,  deviceStream, comm->memManager, ncclMemOffload));
       NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineRecv,    halvingElems,  deviceStream, comm->memManager, ncclMemOffload));
       NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBinePartner, doublingElems, deviceStream, comm->memManager, ncclMemOffload));
+      NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevDhlvBinePartner, halvingElems, deviceStream, comm->memManager, ncclMemOffload));
       NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineIndex,   nRanks,        deviceStream, comm->memManager, ncclMemOffload));
       NCCLCHECK(ncclCudaCallocAsync(&comm->sharedDevBineOrder,   nRanks,        deviceStream, comm->memManager, ncclMemOffload));
       ncclCommPushCudaFree(comm, comm->sharedDevBineSend);
       ncclCommPushCudaFree(comm, comm->sharedDevBineRecv);
       ncclCommPushCudaFree(comm, comm->sharedDevBinePartner);
+      ncclCommPushCudaFree(comm, comm->sharedDevDhlvBinePartner);
       ncclCommPushCudaFree(comm, comm->sharedDevBineIndex);
       ncclCommPushCudaFree(comm, comm->sharedDevBineOrder);
     }
     channel->devBineSend = comm->sharedDevBineSend;
     channel->devBineRecv = comm->sharedDevBineRecv;
     channel->devBinePartner = comm->sharedDevBinePartner;
+    channel->devDhlvBinePartner = comm->sharedDevDhlvBinePartner;
     channel->devBineIndex = comm->sharedDevBineIndex;
     channel->devBineOrder = comm->sharedDevBineOrder;
   }
