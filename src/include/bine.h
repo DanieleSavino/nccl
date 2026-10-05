@@ -32,4 +32,22 @@ NCCL_HOST_DEVICE_INLINE int ncclBineTreeRecv(const int *virtualRecv, int nRanks,
   return ncclBineTreeLookup(virtualRecv, nRanks, steps, root, rank, step);
 }
 
+NCCL_HOST_DEVICE_INLINE static int bineBitrev(int x, int bits) {
+  int y = 0;
+  for (int b = 0; b < bits; ++b) if ((x >> b) & 1) y |= 1 << (bits - 1 - b);
+  return y;
+}
+// kernel step s -> generic (paper) step bits-1-s
+NCCL_HOST_DEVICE_INLINE static int bineSendPartner(const int* partners, int rank, int s, int bits) {
+  return partners[rank * bits + (bits - 1 - s)];
+}
+// buffer position held by `rank` = reverse(nu(rank))
+NCCL_HOST_DEVICE_INLINE static int bineSendIndex(const int* index, int rank, int bits) {
+  return bineBitrev(index[rank], bits);
+}
+// inverse of bineSendIndex: rank that holds position x
+NCCL_HOST_DEVICE_INLINE static int bineSendOrder(const int* order, int x, int bits) {
+  return order[bineBitrev(x, bits)];
+}
+
 #endif // NCCL_BINE_H_

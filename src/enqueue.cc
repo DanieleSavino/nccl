@@ -2165,6 +2165,15 @@ static ncclResult_t calcCollChunking(
   // INFO: [HLC] Bine uses same chunkSteps and sliceSteps as ring.
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->sliceSteps : 1;
+
+  // XXX: Temporary hack to fix Bine's chunkSteps=1 for allgather.
+  if (info->func == ncclFuncAllGather && info->algorithm == NCCL_ALGO_BINE) {
+    info->chunkSteps = 1;
+    info->sliceSteps = 1;
+    chunkSteps = 1;
+    sliceSteps = 1;
+  }
+
   int chunkSize = stepSize*chunkSteps;
   if (info->protocol == NCCL_PROTO_LL) chunkSize /= 2;
   if (info->protocol == NCCL_PROTO_LL128) chunkSize = (chunkSize / NCCL_LL128_LINEELEMS) * NCCL_LL128_DATAELEMS;
