@@ -104,68 +104,27 @@ void ncclGetBineTree(int nRanks, int steps, int *sendTable, int *recvTable)
 }
 
 
-// ------------------------------------------------------------
-// DOUBLING schedule builder
-// ------------------------------------------------------------
-
-// Builds the partner, index, and order tables for the recursive-doubling phase.
-// Each rank is assigned a virtual index via a combined negabinary + Gray-code
-// mapping, and partners are matched by flipping one bit of that index per step.
 void ncclGetBineButterflyDdbl(int nRanks, int steps, int *partners, int *index, int *order)
 {
-  if (nRanks <= 0 || !partners)
-    return;
+  if (nRanks <= 0 || !partners || !index || !order) return;
   assert((1 << steps) == nRanks && "nRanks must be a power of two");
-
-  const size_t elems = (size_t)nRanks * steps;
-  std::fill(partners, partners + elems, -1);
-
-  // Compute the virtual index v(r) for every rank.
-  // Even ranks map through the negabinary of (nRanks - r);
-  // odd ranks map through the negabinary of r.
-  // A Gray-code transform is then applied to produce the final index.
-  std::vector<int> v_representation(nRanks);
-  for (int r = 0; r < nRanks; ++r)
-  {
-    int h_val;
-    if (r % 2 == 0)
-      h_val = rank2nb(nRanks - r, steps); // even rank
-    else
-      h_val = rank2nb(r, steps);           // odd rank
-
-    v_representation[r] = h_val ^ (h_val >> 1); // Gray-code transform: v(r) = h(r) XOR (h(r) >> 1)
+ 
+  for (int r = 0; r < nRanks; ++r) {
+    int h;
+    if (r == 0)          h = 0;
+    else if (r % 2 == 0) h = rank2nb(nRanks - r, steps);
+    else                 h = rank2nb(r, steps);
+    index[r] = h ^ (h >> 1);
   }
-
-  // Populate index and order lookup tables.
-  // index[r]        = virtual index assigned to rank r
-  // order[virt_idx] = physical rank that holds virtual index virt_idx
-  for (int r = 0; r < nRanks; ++r)
-  {
-    const int idxVal = v_representation[r]; // in [0, 2^steps)
-    index[r] = idxVal;
-    order[idxVal] = r;
-  }
-
-  // Build the partner table.
-  // At each step, rank r is paired with the rank whose virtual index differs
-  // from r's by exactly the bit corresponding to that step.
-  for (int step = 0; step < steps; ++step)
-  {
-    const int bit_mask = 1 << step;
-
-    for (int r = 0; r < nRanks; ++r)
-    {
-      const int target_v = v_representation[r] ^ bit_mask;
-
-      // Find the rank whose virtual index matches the target.
-      for (int q = 0; q < nRanks; ++q)
-      {
-        if (v_representation[q] == target_v)
-        {
-          partners[idx(r, step, steps)] = q;
-          break;
-        }
-      }
+  for (int r = 0; r < nRanks; ++r) order[index[r]] = r;
+ 
+  long long rho = 0, pw = 1;
+  for (int j = 0; j < steps; ++j, pw *= -2) {
+    rho += pw;
+    const long long m = ((rho % nRanks) + nRanks) % nRanks;
+    for (int r = 0; r < nRanks; ++r) {
+      const long long q = (r % 2 == 0) ? (r + m) % nRanks : (r - m + nRanks) % nRanks;
+      partners[idx(r, j, steps)] = (int)q;
     }
   }
 }
