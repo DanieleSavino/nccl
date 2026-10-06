@@ -901,7 +901,8 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_S
     ncclBine *bine = &ncclShmem.channel.bine;
     const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
 
-    using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
+    // XXX: Temporary hack to fix Bine's chunkSteps=1 for reduceScatter.
+    using Proto = ProtoSimple<1, 1>;
 
     switch (bufferManagement) {
       case BLOCK_BY_BLOCK:
