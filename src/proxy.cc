@@ -730,6 +730,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
   // Kernel step s -> generic step doublingSteps-1-s (bineSendPartner). Kernel step s moves 2^s blocks.
   if (hasDoubling) {
     switch (buffMan) {
+    case PERMUTATION :
     case BLOCK_BY_BLOCK: {
       // AG: kernel step s ascending. RS: paper step j ascending = kernel step steps-1-j, i.e. s descending.
       const bool isRS = (op->coll == ncclFuncReduceScatter);
@@ -746,9 +747,15 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
     }
 
     case DOUBLE_SEND: {
-      // dhlvBinePartner keeps its own convention.
-      for (int step = 0; step < doublingSteps; ++step) {
-        int partner = channel->dhlvBinePartner[rank * doublingSteps + step];
+      const bool isRS = (op->coll == ncclFuncReduceScatter);
+      const bool isAG = (op->coll == ncclFuncAllGather);
+      if (!isRS && !isAG) {
+        WARN("BINE DOUBLE_SEND is only implemented for ReduceScatter/AllGather");
+        return ncclInternalError;
+      }
+      for (int i = 0; i < doublingSteps; ++i) {
+        const int step = isAG ? (doublingSteps - 1 - i) : i;
+        const int partner = channel->dhlvBinePartner[rank * doublingSteps + step];
         if (partner < 0 || partner == rank) continue;
         const int span = 1 << (doublingSteps - 1 - step);
         op->nsteps = span * nLoops * chunkSteps;
