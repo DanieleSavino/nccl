@@ -225,9 +225,7 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
   ssize_t count, gridOffset, channelCount, chunkCount;
   ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
                   &gridOffset, &channelCount, &chunkCount);
-
-  if (channelCount == 0)
-    return;
+  if (channelCount == 0) return;
 
   T *recvBuf = (T *)work->recvbuff;
   T *sendBuf = (T *)work->sendbuff;
@@ -235,68 +233,52 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
 
   T *mySeg = recvBuf + (ssize_t)rank * count;
   if (sendBuf != mySeg) {
-    for (ssize_t elem = tid; elem < channelCount; elem += nthreads) {
-      mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
-    }
+    for (ssize_t e = tid; e < channelCount; e += nthreads)
+      mySeg[gridOffset + e] = sendBuf[gridOffset + e];
   }
-
-  // Wait for other segments.
   __syncthreads();
 
-  const int myIdx = bine->index[rank];
+  const int myIdx = bineSendIndex(bine->index, rank, steps);
   const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
                          (NCCL_P2P_READ | NCCL_P2P_WRITE);
 
-  for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-    const ssize_t dataOff = gridOffset + elem;
-    const int ne = (int)min(chunkCount, channelCount - elem);
-
-    for (int s = 0; s < steps; ++s) {
-      const int partner = bine->partners[rank * steps + s];
-      if (partner < 0)
-        continue;
-
-      // DDBL
+  for (int s = 0; s < steps; ++s) {
+    const int partner = bineSendPartner(bine->partners, rank, s, steps);
+    if (partner >= 0) {
       const int span = 1 << s;
-      const int blockSize = span << 1;
-      const int base = (myIdx / blockSize) * blockSize;
+      const int base = (myIdx >> (s + 1)) << (s + 1);
       const bool keepLower = ((myIdx >> s) & 1) == 0;
-
       const int sendBeg = keepLower ? base : base + span;
       const int recvBeg = keepLower ? base + span : base;
-
       int peers[1] = {partner};
 
-      auto runStepInterleaved = [&](auto &prim) {
-        for (int j = 0; j < span; ++j) {
-          int sIdx = sendBeg + j;
-          int rIdx = recvBeg + j;
-
-          ssize_t sendOff = dataOff + (ssize_t)bine->order[sIdx] * count;
-          ssize_t recvOff = dataOff + (ssize_t)bine->order[rIdx] * count;
-
-          // WARN: send then receive to avoid deadlock.
-          prim.directSendFromOutput(sendOff, ne);
-          prim.directRecv(recvOff, ne);
+      auto run = [&](auto &prim, bool direct) {
+        for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
+          const ssize_t dataOff = gridOffset + elem;
+          const int ne = (int)min(chunkCount, channelCount - elem);
+          for (int j = 0; j < span; ++j) {
+            // position -> block id (= rank that owns that position)
+            const int sBlk = bineSendOrder(bine->order, sendBeg + j, steps);
+            const int rBlk = bineSendOrder(bine->order, recvBeg + j, steps);
+            const ssize_t sOff = (ssize_t)sBlk * count + dataOff;
+            const ssize_t rOff = (ssize_t)rBlk * count + dataOff;
+            if (direct) { prim.directSendFromOutput(sOff, ne); prim.directRecv(rOff, ne); }
+            else        { prim.sendFromOutput(sOff, ne);       prim.recv(rOff, ne); }
+          }
         }
       };
 
       if (useDirect) {
         Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
             tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-        runStepInterleaved(prim);
+        run(prim, true);
       } else {
         Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
             tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-
-        for (int j = 0; j < span; ++j) {
-          ssize_t sendOff = dataOff + (ssize_t)bine->order[sendBeg + j] * count;
-          ssize_t recvOff = dataOff + (ssize_t)bine->order[recvBeg + j] * count;
-          prim.sendFromOutput(sendOff, ne);
-          prim.recv(recvOff, ne);
-        }
+        run(prim, false);
       }
     }
+    __syncthreads();
   }
 }
 } // namespace
