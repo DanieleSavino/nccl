@@ -2167,8 +2167,8 @@ static ncclResult_t calcCollChunking(
   int chunkSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->chunkSteps : 1;
   int sliceSteps = (info->protocol == NCCL_PROTO_SIMPLE && (info->algorithm == NCCL_ALGO_RING || info->algorithm == NCCL_ALGO_BINE)) ? info->sliceSteps : 1;
 
-  // XXX: Temporary hack to fix Bine's chunkSteps=1 for AllGather and ReduceScatter.
-  if (info->algorithm == NCCL_ALGO_BINE && (info->func == ncclFuncAllGather || info->func == ncclFuncReduceScatter)) {
+  // XXX: Temporary hack to fix Bine's chunkSteps=1 for AllGather, ReduceScatter and AllReduce.
+  if (info->algorithm == NCCL_ALGO_BINE && (info->func == ncclFuncAllGather || info->func == ncclFuncReduceScatter || info->func == ncclFuncAllReduce)) {
     info->chunkSteps = 1;
     info->sliceSteps = 1;
     chunkSteps = 1;

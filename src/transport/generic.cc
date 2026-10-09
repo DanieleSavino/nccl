@@ -96,48 +96,49 @@ fail:
 ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   if (comm == nullptr || comm->nRanks <= 1) return ret;
-
+ 
   const int nRanks = comm->nRanks;
   bool anySchedules = false;
   bool connectedAnyPeers = false;
   int connectedChannels = 0;
   struct ncclTopoGraph* setupGraph = nullptr;
-
-  INFO(NCCL_INIT, "BINE connect rank %d cudaDev %d nRanks %d nChannels %d", comm->rank, comm->cudaDev, comm->nRanks, comm->nChannels);
-
+ 
+  INFO(NCCL_INIT, "BINE connect rank %d cudaDev %d nRanks %d nChannels %d",
+       comm->rank, comm->cudaDev, comm->nRanks, comm->nChannels);
+ 
   auto isBineEnabledFor = [&](ncclFunc_t func) {
     for (int proto = 0; proto < NCCL_NUM_PROTOCOLS; ++proto) {
       if (comm->bandwidths[func][NCCL_ALGO_BINE][proto] > 0.0f) return true;
     }
     return false;
   };
-
-  const bool bcastEnabled   = isBineEnabledFor(ncclFuncBroadcast);
-  const bool reduceEnabled  = isBineEnabledFor(ncclFuncReduce);
-  const bool rsEnabled      = isBineEnabledFor(ncclFuncReduceScatter);
-  const bool agEnabled      = isBineEnabledFor(ncclFuncAllGather);
-  const bool arEnabled      = isBineEnabledFor(ncclFuncAllReduce);
-
+ 
+  const bool bcastEnabled  = isBineEnabledFor(ncclFuncBroadcast);
+  const bool reduceEnabled = isBineEnabledFor(ncclFuncReduce);
+  const bool rsEnabled     = isBineEnabledFor(ncclFuncReduceScatter);
+  const bool agEnabled     = isBineEnabledFor(ncclFuncAllGather);
+  const bool arEnabled     = isBineEnabledFor(ncclFuncAllReduce);
+ 
   for (int c = 0; c < comm->nChannels; ++c) {
     struct ncclChannel* channel = comm->channels + c;
     const int steps = channel->bine.nSteps;
     const int doublingSteps = channel->bine.nDoublingSteps;
-
+ 
     INFO(NCCL_INIT,
          "BINE channel %d steps %d doublingSteps %d bufferManagement %s partner=%p dhlvPartner=%p index=%p order=%p",
          c, steps, doublingSteps,
          ncclBineBufferManagementToString(channel->bine.bufferManagement),
          channel->binePartner, channel->dhlvBinePartner, channel->bineIndex, channel->bineOrder);
-
+ 
     if (steps == 0 && doublingSteps == 0) {
       INFO(NCCL_INIT, "BINE channel %d has zero steps and will be skipped", c);
       continue;
     }
-
+ 
     const bool hasStepTables = steps > 0 && channel->bineSend && channel->bineRecv;
     const bool hasDoublingTables =
         doublingSteps > 0 && (channel->binePartner != nullptr || channel->dhlvBinePartner != nullptr);
-
+ 
     if (steps > 0 && !hasStepTables) {
       WARN("BINE send/recv tables are missing for channel %d", c);
       ret = ncclInternalError; goto fail;
@@ -146,46 +147,48 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       WARN("BINE partner tables are missing for channel %d", c);
       ret = ncclInternalError; goto fail;
     }
-    // Generic tables + SEND views (bit-reversal) are defined only for power-of-two.
     if (doublingSteps > 0 && (1 << doublingSteps) != nRanks) {
       WARN("BINE doubling schedule requires nRanks == 2^doublingSteps (nRanks %d, doublingSteps %d, channel %d)",
            nRanks, doublingSteps, c);
       ret = ncclInternalError; goto fail;
     }
-
+ 
     const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
-
+ 
     if (buffMan == SEND && doublingSteps > 0 &&
         (channel->bineIndex == nullptr || channel->bineOrder == nullptr)) {
       WARN("BINE index/order tables are missing for SEND on channel %d", c);
       ret = ncclInternalError; goto fail;
     }
-
-    // AllReduce on SEND = RS halving + AG doubling over binePartner[] only.
-    const bool arDoublingOnly =
+ 
+    // ---- AllReduce variants ----
+    // RSAG: RS halving + AG doubling over binePartner[] only (SEND buffers).
+    const bool arRsagOk =
         arEnabled && buffMan == SEND && doublingSteps > 0 && channel->binePartner != nullptr;
-    const bool arNeedsTree = arEnabled && !arDoublingOnly;
-
+    // TREE: pipelined reduce+bcast on one fixed-root tree per channel.
+    const bool arTreeOk = arEnabled && hasStepTables && steps <= BINE_AR_MAX_FAN;
+    // Legacy all-roots tree for AR, only if neither new variant covers it.
+    const bool arNeedsTree = arEnabled && !arRsagOk && !arTreeOk;
+ 
     const bool enableBroadcastPhase = hasStepTables && (bcastEnabled || arNeedsTree);
     const bool enableReducePhase    = hasStepTables && (reduceEnabled || rsEnabled || arNeedsTree);
     const bool enableDoublingPhase  = hasDoublingTables && (rsEnabled || agEnabled || arEnabled);
-    // SEND redistribution (AG pre-step / RS post-step). AllReduce never uses it.
     const bool enableRedistribution = enableDoublingPhase && buffMan == SEND && (agEnabled || rsEnabled);
-
-    if (!(enableBroadcastPhase || enableReducePhase || enableDoublingPhase)) {
+ 
+    if (!(enableBroadcastPhase || enableReducePhase || enableDoublingPhase || arTreeOk)) {
       INFO(NCCL_INIT, "BINE channel %d: all phases disabled", c);
       continue;
     }
     anySchedules = true;
-
+ 
     std::vector<int> sendPeers, recvPeers;
     auto addPeer = [&](int peer, bool sendToPeer, bool recvFromPeer) {
       if (peer < 0 || peer == comm->rank) return;
       if (sendToPeer) sendPeers.push_back(peer);
       if (recvFromPeer) recvPeers.push_back(peer);
     };
-
-    // ---- Tree (halving) phase ----
+ 
+    // ---- Tree (halving) phase for bcast / reduce / legacy AR: all roots ----
     if (enableBroadcastPhase || enableReducePhase) {
       const int rank = comm->rank;
       for (int root = 0; root < nRanks; ++root) {
@@ -203,10 +206,23 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
         }
       }
     }
-
+ 
+    // ---- AR TREE variant: only this channel's root. Bidirectional on every
+    //      neighbour (reduce uses child->parent, bcast uses parent->child). ----
+    if (arTreeOk) {
+      const int root = ncclBineArRoot(c, nRanks);
+      int children[BINE_AR_MAX_FAN];
+      int nChildren, parent;
+      ncclBineArTreeNeighbors(channel->bineSend, channel->bineRecv, nRanks, steps, root,
+                              comm->rank, children, &nChildren, &parent);
+      for (int i = 0; i < nChildren; ++i) addPeer(children[i], true, true);
+      addPeer(parent, true, true);
+      INFO(NCCL_INIT, "BINE AR tree channel %d root %d rank %d children %d parent %d",
+           c, root, comm->rank, nChildren, parent);
+    }
+ 
     // ---- Doubling / butterfly phase ----
     if (enableDoublingPhase) {
-      // SEND redistribution peers are views over the generic tables.
       if (enableRedistribution) {
         const int redistTo   = bineSendOrder(channel->bineOrder, comm->rank, doublingSteps);
         const int redistFrom = bineSendIndex(channel->bineIndex, comm->rank, doublingSteps);
@@ -215,27 +231,23 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
           addPeer(redistFrom, true, true);
         }
       }
-      // Generic partners (AG, RS, BLOCK_BY_BLOCK, SEND-AR). Bidirectional + dedup,
-      // so step order is irrelevant here.
-      // TODO: if DOUBLE_SEND never reads binePartner, gate with buffMan != DOUBLE_SEND.
       if (channel->binePartner != nullptr) {
         for (int s = 0; s < doublingSteps; ++s)
           addPeer(bineSendPartner(channel->binePartner, comm->rank, s, doublingSteps), true, true);
       }
-      // dhlv partners: ONLY DOUBLE_SEND uses them.
       if (channel->dhlvBinePartner != nullptr && buffMan == DOUBLE_SEND) {
         for (int step = 0; step < doublingSteps; ++step)
           addPeer(channel->dhlvBinePartner[comm->rank * doublingSteps + step], true, true);
       }
     }
-
+ 
     auto dedup = [](std::vector<int>& peers) {
       std::sort(peers.begin(), peers.end());
       peers.erase(std::unique(peers.begin(), peers.end()), peers.end());
     };
     dedup(sendPeers);
     dedup(recvPeers);
-
+ 
     if (!sendPeers.empty() || !recvPeers.empty()) {
       NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c,
           (int)recvPeers.size(), recvPeers.empty() ? nullptr : recvPeers.data(),
@@ -247,13 +259,13 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
       INFO(NCCL_INIT, "BINE channel %d produced no distinct peers after dedup", c);
     }
   }
-
+ 
   if (!anySchedules) goto exit;
   if (!connectedAnyPeers) {
     WARN("BINE schedule tables produced no peer connections");
     ret = ncclInternalError; goto fail;
   }
-
+ 
   setupGraph = &comm->graphs[NCCL_ALGO_TREE];
   if (setupGraph->nChannels <= 0) {
     WARN("BINE connect rank %d: topo graph for P2P setup has no channels", comm->rank);
@@ -261,7 +273,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
   }
   NCCLCHECKGOTO(ncclTransportP2pSetup(comm, setupGraph, 0), ret, fail);
   INFO(NCCL_INIT, "Connected BINE peers on %d channels", connectedChannels);
-
+ 
 exit:
   if (!anySchedules)
     INFO(NCCL_INIT, "BINE connect rank %d disabled: all phases removed", comm->rank);

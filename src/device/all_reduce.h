@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "device.h"
+#include "bine.h"
 #include "collectives.h"
 #include "primitives.h"
 
@@ -82,6 +83,211 @@ namespace {
       prims.directRecv(offset, nelem);
     }
   }
+
+
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int nSteps = bine->nSteps;
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank   = ncclShmem.comm.rank;
+ 
+  ssize_t gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr,
+                  &gridOffset, &channelCount, &chunkCount);
+  if (channelCount == 0) return;   // proxy registers nothing for empty channels
+ 
+  const int root = ncclBineArRoot(ncclShmem.channelId, nRanks);
+  int children[BINE_AR_MAX_FAN];
+  int nChildren, parent;
+  ncclBineArTreeNeighbors(bine->send, bine->recv, nRanks, nSteps, root, rank,
+                          children, &nChildren, &parent);
+ 
+  // Degenerate: single rank.
+  if (nChildren == 0 && parent < 0) {
+    const T* in = (const T*)work->sendbuff;
+    T* out = (T*)work->recvbuff;
+    if (in != out)
+      for (ssize_t e = tid; e < channelCount; e += nthreads)
+        out[gridOffset + e] = in[gridOffset + e];
+    return;
+  }
+ 
+  // ---------------- root: fused reduce + broadcast ----------------
+  if (parent < 0) {
+    Primitives<T, RedOp, FanSymmetric<BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+        prims(tid, nthreads, children, children, work->sendbuff, work->recvbuff,
+              work->redOpArg, 0, 0, 0, work);
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+      prims.recvReduceCopySend(off, off, nelem, /*postOp=*/true);
+    }
+    return;
+  }
+ 
+  // ---------------- non-root: split threads ----------------
+  int nthreadsSplit;
+  if (Proto::Id == NCCL_PROTO_SIMPLE) {
+    nthreadsSplit = nthreads / 2;
+    if (nthreadsSplit >= 256) nthreadsSplit += 64;
+  } else {  // LL / LL128: receiving from several sources costs more than sending
+    nthreadsSplit = (nthreads * 7 / (10 * WARP_SIZE)) * WARP_SIZE;
+  }
+ 
+  if (tid < nthreadsSplit) {
+    // Reduce up: recv from all children (+ own input), send to parent.
+    Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 1>, /*Direct=*/0, Proto, 0>
+        prims(tid, nthreadsSplit, children, &parent, work->sendbuff, work->recvbuff,
+              work->redOpArg, 0 * Proto::MaxGroupWidth, 0, 0, work);
+    if (nChildren == 0) {
+      for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+        const ssize_t off = gridOffset + e;
+        prims.send(off, (int)min(chunkCount, channelCount - e));
+      }
+    } else {
+      for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+        const ssize_t off = gridOffset + e;
+        prims.recvReduceSend(off, (int)min(chunkCount, channelCount - e));
+      }
+    }
+  } else {
+    // Broadcast down: recv from parent, write to output, forward to children.
+    Primitives<T, RedOp, FanAsymmetric<1, BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+        prims(tid - nthreadsSplit, nthreads - nthreadsSplit, &parent, children,
+              work->sendbuff, work->recvbuff, work->redOpArg,
+              1 * Proto::MaxGroupWidth, 0, 0, work);
+    if (nChildren == 0) {
+      for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+        const ssize_t off = gridOffset + e;
+        prims.recv(off, (int)min(chunkCount, channelCount - e));
+      }
+    } else {
+      for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+        const ssize_t off = gridOffset + e;
+        prims.recvCopySend(off, (int)min(chunkCount, channelCount - e));
+      }
+    }
+  }
+}
+
+
+// AllReduce = Bine RS (halving, in position space) + Bine AG (doubling), SEND buffer management.
+// Position p lives at block slot p of the (recvbuff) vector. The RS leaves the fully reduced
+// block at slot myIdx, and the AG starts from that same slot, so no redistribution is needed.
+//
+// Layout: like ring allreduce, each channel slice is cut into loops of nRanks blocks of chunkCount
+// elements. Block b of loop l starts at gridOffset + l*nRanks*chunkCount + b*chunkCount.
+// Tail blocks can be short or empty, but both sides derive the same size from the block index,
+// and empty blocks still run a primitive call so the proxy slot count matches.
+
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBineSend(int tid, int nthreads,
+                                            ncclDevWorkColl *work) {
+  ncclBine *bine = &ncclShmem.channel.bine;
+  const int steps  = bine->nDoublingSteps;   // nRanks == 1 << steps
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank   = ncclShmem.comm.rank;
+
+  ssize_t gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), (ssize_t*)nullptr,
+                  &gridOffset, &channelCount, &chunkCount);
+  if (channelCount == 0) return;
+
+  // chunkSteps == 1: one block transfer must fit in exactly one FIFO step.
+  // The proxy must derive the same chunk size.
+  const ssize_t stepCount = (ssize_t)(Proto::calcBytePerStep() / sizeof(T));
+  if (chunkCount > stepCount) chunkCount = stepCount;
+
+  const T *sendBuf = (const T *)work->sendbuff;
+  T *recvBuf = (T *)work->recvbuff;
+
+  // ---- 0. Seed the accumulator (sendbuff stays untouched) ----
+  if ((const void *)sendBuf != (void *)recvBuf) {
+    for (ssize_t e = tid; e < channelCount; e += nthreads)
+      recvBuf[gridOffset + e] = sendBuf[gridOffset + e];
+  }
+  __syncthreads();
+  if (steps == 0) return;
+
+  const int myIdx = bineSendIndex(bine->index, rank, steps);
+  const bool useDirect = false; //(work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
+                         //(NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+  const ssize_t loopCount = (ssize_t)nRanks * chunkCount;
+  const ssize_t nLoops    = (channelCount + loopCount - 1) / loopCount;
+  const ssize_t chEnd     = gridOffset + channelCount;
+
+  // Offset and element count of block b in loop l (clipped to the channel slice, may be 0).
+  auto blk = [&](ssize_t l, int b, ssize_t &off) -> int {
+    off = gridOffset + l * loopCount + (ssize_t)b * chunkCount;
+    const ssize_t n = chEnd - off;
+    return (int)(n <= 0 ? 0 : (n < chunkCount ? n : chunkCount));
+  };
+
+  // One butterfly step with `partner`: one Primitives, span blocks per loop, all loops.
+  auto exchange = [&](int partner, int sendBeg, int recvBeg, int span,
+                      bool reduce, bool doPost) {
+    int peers[1] = {partner};
+    auto body = [&](auto &prim, bool direct) {
+      for (ssize_t l = 0; l < nLoops; ++l) {
+        for (int j = 0; j < span; ++j) {
+          ssize_t sOff, rOff;
+          const int sN = blk(l, sendBeg + j, sOff);
+          const int rN = blk(l, recvBeg + j, rOff);
+          if (direct) {
+            prim.directSendFromOutput(sOff, sN);
+            if (reduce) prim.directRecvReduceCopy(rOff, rOff, rN, doPost);
+            else        prim.directRecv(rOff, rN);
+          } else {
+            prim.sendFromOutput(sOff, sN);
+            if (reduce) prim.recvReduceCopy(rOff, rOff, rN, doPost);
+            else        prim.recv(rOff, rN);
+          }
+        }
+      }
+    };
+    if (useDirect) {
+      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
+          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg, 0, 0, 0, work);
+      body(prim, true);
+    } else {
+      Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
+          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg, 0, 0, 0, work);
+      body(prim, false);
+    }
+  };
+
+  // ---- 1. Reduce-scatter: halving, kernel steps steps-1 .. 0 ----
+  for (int s = steps - 1; s >= 0; --s) {
+    const int partner = bineSendPartner(bine->partners, rank, s, steps);
+    if (partner < 0 || partner == rank) continue;   // must match the proxy's skip condition
+
+    const int span       = 1 << s;
+    const int base       = (myIdx / (span << 1)) * (span << 1);
+    const bool keepLower = ((myIdx >> s) & 1) == 0;
+    const int sendBeg    = keepLower ? base + span : base;
+    const int recvBeg    = keepLower ? base : base + span;
+
+    exchange(partner, sendBeg, recvBeg, span, /*reduce=*/true, /*doPost=*/(s == 0));
+    __syncthreads();
+  }
+
+  // ---- 2. Allgather: doubling, kernel steps 0 .. steps-1 ----
+  for (int s = 0; s < steps; ++s) {
+    const int partner = bineSendPartner(bine->partners, rank, s, steps);
+    if (partner < 0 || partner == rank) continue;
+
+    const int span       = 1 << s;
+    const int base       = (myIdx / (span << 1)) * (span << 1);
+    const bool keepLower = ((myIdx >> s) & 1) == 0;
+    const int sendBeg    = keepLower ? base : base + span;
+    const int recvBeg    = keepLower ? base + span : base;
+
+    exchange(partner, sendBeg, recvBeg, span, /*reduce=*/false, /*doPost=*/false);
+    __syncthreads();
+  }
+}
 
   template<typename T, typename RedOp, typename Proto>
   __device__ __forceinline__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -777,5 +983,26 @@ template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_TREE, NCCL_PROTO_LL128> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     runTreeSplit<T, RedOp, ProtoLL128>(tid, nthreads, work);
+  }
+};
+
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+
+    // Same chunkSteps=1 hack as the RS/AG specializations.
+    using Proto = ProtoSimple<1, 1>;
+
+    if (bine->bufferManagement == SEND)
+      runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+    else if (bine->bufferManagement == TREE)
+      runBineTree<T, RedOp, Proto>(tid, nthreads, work);
+    else {
+      // Connect/SaveProxyBine only register the tree phases for non-SEND, so there is no
+      // doubling connectivity here.
+      assert(false && "Bine AllReduce doubling path requires SEND buffer management");
+    }
   }
 };

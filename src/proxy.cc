@@ -670,6 +670,37 @@ static ncclResult_t SaveProxy(struct ncclComm *comm,
   return ncclSuccess;
 }
 
+static ncclResult_t SaveProxyBineArTree(struct ncclComm* comm, struct ncclChannel* channel,
+                                        struct ncclProxyOp* op, bool* justInquire) {
+  const int nRanks = comm->nRanks;
+  const int rank = comm->rank;
+  const int steps = channel->bine.nSteps;
+  if (steps == 0 || channel->bineSend == nullptr || channel->bineRecv == nullptr) {
+    WARN("BINE AR tree requested but send/recv tables are missing (channel %d)", channel->id);
+    return ncclInternalError;
+  }
+  if (steps > BINE_AR_MAX_FAN) {
+    WARN("BINE AR tree: %d steps exceeds max fan %d", steps, BINE_AR_MAX_FAN);
+    return ncclInternalError;
+  }
+ 
+  const int root = ncclBineArRoot(channel->id, nRanks);
+  int children[BINE_AR_MAX_FAN];
+  int nChildren, parent;
+  ncclBineArTreeNeighbors(channel->bineSend, channel->bineRecv, nRanks, steps, root, rank,
+                          children, &nChildren, &parent);
+ 
+  for (int i = 0; i < nChildren; ++i) {
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, children[i], op, 0, justInquire)); // reduce
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, children[i], op, 0, justInquire)); // bcast
+  }
+  if (parent >= 0) {
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, parent, op, 0, justInquire));      // reduce
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, parent, op, 0, justInquire));      // bcast
+  }
+  return ncclSuccess;
+}
+
 static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *channel,
                                   struct ncclProxyOp *op, bool *justInquire) {
   const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
@@ -730,6 +761,12 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
   // Kernel step s -> generic step doublingSteps-1-s (bineSendPartner). Kernel step s moves 2^s blocks.
   if (hasDoubling) {
     switch (buffMan) {
+    case TREE: {
+      if(op->coll == ncclFuncAllReduce) {
+        NCCLCHECK(SaveProxyBineArTree(comm, channel, op, justInquire));
+        return ncclSuccess;
+      }
+    }
     case PERMUTATION :
     case BLOCK_BY_BLOCK: {
       // AG: kernel step s ascending. RS: paper step j ascending = kernel step steps-1-j, i.e. s descending.
