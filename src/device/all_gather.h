@@ -94,12 +94,49 @@ __device__ __forceinline__ void runRing(int tid, int nthreads,
     barrier_sync(14, nthreads);
 }
 
-template <typename T, typename RedOp>
-__device__ __forceinline__ void runBineSendPat(int tid, int nthreads, ncclDevWorkColl* work) {
+
+// In-place: new[x] = old[f(x)], restricted to this channel's column slice.
+// f must be a permutation of [0, nRanks). Cycle-following, no scratch buffer.
+template <typename T, typename F>
+__device__ __forceinline__ void bineInPlacePermute(
+    int tid, int nthreads, T *buf, F f, int nRanks,
+    ssize_t count, ssize_t gridOffset, ssize_t channelCount)
+{
+  for (int i = 0; i < nRanks; ++i) {
+    int j = f(i);
+    if (j == i) continue;
+    bool leader = true;                       // is i the smallest index in its cycle?
+    while (j != i) {
+      if (j < i) { leader = false; break; }
+      j = f(j);
+    }
+    if (!leader) continue;
+
+    for (ssize_t e = tid; e < channelCount; e += nthreads) {
+      const ssize_t col = gridOffset + e;
+      T tmp = buf[(ssize_t)i * count + col];
+      int cur = i;
+      while (true) {
+        const int nxt = f(cur);
+        if (nxt == i) { buf[(ssize_t)cur * count + col] = tmp; break; }
+        buf[(ssize_t)cur * count + col] = buf[(ssize_t)nxt * count + col];
+        cur = nxt;
+      }
+    }
+  }
+}
+
+struct BineNoPost {
+  __device__ __forceinline__ void operator()(size_t, size_t, size_t) const {}
+};
+
+template <typename T, typename RedOp, typename MakeAlgo, typename PostFn = BineNoPost>
+__device__ __forceinline__ void runBineAgPat(int tid, int nthreads, ncclDevWorkColl* work,
+                                             MakeAlgo makeAlgo, PostFn post = PostFn()) {
 #if __CUDA_ARCH__ >= 600
   using Proto = ProtoSimple<1, 1>;
   ncclBine* bine = &ncclShmem.channel.bine;
-  const int S = bine->nDoublingSteps, rank = ncclShmem.comm.rank;
+  const int S = bine->nDoublingSteps;
   size_t count, channelOffset, channelCount, chunkCount;
   ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
                   &channelOffset, &channelCount, &chunkCount);
@@ -116,9 +153,7 @@ __device__ __forceinline__ void runBineSendPat(int tid, int nthreads, ncclDevWor
 
   if (tid == nworkers) {                       // schedule thread
     BineAgGeom g; g.init(S, count, channelOffset, channelCount, chunkCount, slotElems);
-    const int myIdx = bineSendIndex(bine->index, rank, S);
-    BineAgPre pre = bineAgPre(bine->partners, bine->index, bine->order, rank, S);
-    BineAGAlgorithm algo(g, rank, myIdx, pre);
+    auto algo = makeAlgo(g);
     shmem->parallelFactor = algo.getParallelFactor();
     int step = 0;
     while (1) {
@@ -154,7 +189,59 @@ __device__ __forceinline__ void runBineSendPat(int tid, int nthreads, ncclDevWor
       step += nGroups;
     }
   }
+  // Every thread (schedule, workers, idle) reaches this point, so the hook may __syncthreads().
+  post(count, channelOffset, channelCount);
 #endif
+}
+
+template <typename T, typename RedOp>
+__device__ __forceinline__ void runBineSendPat(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int S = bine->nDoublingSteps, rank = ncclShmem.comm.rank;
+  runBineAgPat<T, RedOp>(tid, nthreads, work, [&](const BineAgGeom& g) {
+    const int myIdx = bineSendIndex(bine->index, rank, S);
+    BineAgPre pre = bineAgPre(bine->partners, bine->index, bine->order, rank, S);
+    return BineAGAlgorithm(g, rank, myIdx, pre);
+  });
+}
+
+template <typename T, typename RedOp>
+__device__ __forceinline__ void runBineDoubleSendPat(int tid, int nthreads, ncclDevWorkColl* work) {
+  const int rank = ncclShmem.comm.rank;
+  runBineAgPat<T, RedOp>(tid, nthreads, work, [&](const BineAgGeom& g) {
+    return BineAGDoubleSendAlgorithm(g, rank);
+  });
+}
+
+template <typename T, typename RedOp>
+__device__ __forceinline__ void runBineBlockByBlockPat(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int S = bine->nDoublingSteps, rank = ncclShmem.comm.rank;
+  runBineAgPat<T, RedOp>(tid, nthreads, work, [&](const BineAgGeom& g) {
+    const int myIdx = bineSendIndex(bine->index, rank, S);
+    return BineAGBlockByBlockAlgorithm(g, rank, myIdx, bine->order);
+  });
+}
+
+template <typename T, typename RedOp>
+__device__ __forceinline__ void runBinePermutationPat(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int S = bine->nDoublingSteps;
+  const int rank = ncclShmem.comm.rank, nRanks = ncclShmem.comm.nRanks;
+  const int myIdx = bineSendIndex(bine->index, rank, S);
+  const int* idxTbl = bine->index;
+  T* recvBuf = (T*)work->recvbuff;
+
+  runBineAgPat<T, RedOp>(tid, nthreads, work,
+    [&](const BineAgGeom& g) { return BineAGPermutationAlgorithm(g, myIdx); },
+    // post: received data must be visible, then block b <- position index(b)
+    [&](size_t count, size_t channelOffset, size_t channelCount) {
+      __syncthreads();
+      if (channelCount == 0) return;
+      bineInPlacePermute<T>(tid, nthreads, recvBuf,
+          [&](int b) { return bineSendIndex(idxTbl, b, S); },
+          nRanks, (ssize_t)count, (ssize_t)channelOffset, (ssize_t)channelCount);
+    });
 }
 
 template <typename T, typename RedOp, typename Proto>
@@ -417,37 +504,6 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
       }
     }
     __syncthreads();
-  }
-}
-
-// In-place: new[x] = old[f(x)], restricted to this channel's column slice.
-// f must be a permutation of [0, nRanks). Cycle-following, no scratch buffer.
-template <typename T, typename F>
-__device__ __forceinline__ void bineInPlacePermute(
-    int tid, int nthreads, T *buf, F f, int nRanks,
-    ssize_t count, ssize_t gridOffset, ssize_t channelCount)
-{
-  for (int i = 0; i < nRanks; ++i) {
-    int j = f(i);
-    if (j == i) continue;
-    bool leader = true;                       // is i the smallest index in its cycle?
-    while (j != i) {
-      if (j < i) { leader = false; break; }
-      j = f(j);
-    }
-    if (!leader) continue;
-
-    for (ssize_t e = tid; e < channelCount; e += nthreads) {
-      const ssize_t col = gridOffset + e;
-      T tmp = buf[(ssize_t)i * count + col];
-      int cur = i;
-      while (true) {
-        const int nxt = f(cur);
-        if (nxt == i) { buf[(ssize_t)cur * count + col] = tmp; break; }
-        buf[(ssize_t)cur * count + col] = buf[(ssize_t)nxt * count + col];
-        cur = nxt;
-      }
-    }
   }
 }
 
@@ -1257,13 +1313,13 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE,
 
     switch (bufferManagement) {
     case BLOCK_BY_BLOCK:
-      runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
+      runBineBlockByBlockPat<T, RedOp>(tid, nthreads, work);
       break;
     case PERMUTATION:
-      runBinePermutation<T, RedOp, Proto>(tid, nthreads, work);
+      runBinePermutationPat<T, RedOp>(tid, nthreads, work);
       break;
     case DOUBLE_SEND:
-      runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
+      runBineDoubleSendPat<T, RedOp>(tid, nthreads, work);
       break;
     // XXX: Temporary hack to work with PAT impl.
     case SEND:

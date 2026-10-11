@@ -143,3 +143,254 @@ public:
 #endif
   }
 };
+
+class BineAGDoubleSendAlgorithm {
+  BineAgGeom g; int rank, p, mask;
+  int stage;                 // 0 local copy, 1 butterfly, 2 done, 3 empty channel
+  int e;                     // stage-0 chunk cursor
+  int s, dim, span, winStart, sendStart, recvStart, gi, k, half, nSlots; size_t total;
+ 
+  __device__ __host__ static size_t bmin(size_t a, size_t b) { return a < b ? a : b; }
+ 
+  __device__ __host__ void enterStep(int step) {
+    s = step; span = 1 << s; dim = g.S - 1 - s;
+    const bool sendBottom = ((rank & 1) == (s & 1));
+    sendStart = winStart;
+    recvStart = sendBottom ? ((winStart - span + p) & mask) : ((winStart + span) & mask);
+    if (sendBottom) winStart = recvStart;
+    total  = (size_t)g.nChunks << s;
+    nSlots = g.stepSlots(s);
+    gi = 0; k = 0; half = 0;
+  }
+ 
+public:
+  __device__ __host__ BineAGDoubleSendAlgorithm(const BineAgGeom& g_, int rank_)
+      : g(g_), rank(rank_), p(1 << g_.S), mask((1 << g_.S) - 1),
+        stage(g_.nChunks == 0 ? 3 : 0), e(0),
+        s(0), dim(0), span(1), winStart(rank_), sendStart(0), recvStart(0),
+        gi(0), k(0), half(0), nSlots(0), total(0) {}
+ 
+  __device__ __host__ int getParallelFactor() const { return 1; }  // single group, as in BineAGAlgorithm
+ 
+  __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
+    int flags = PatUsed;
+    ps->last = 0; ps->nelem = 0; ps->inpIx = ps->outIx = 0;
+    ps->sendDim = ps->recvDim = -1; ps->sendOffset = ps->recvOffset = -1;
+    ps->stepOffset = 0; ps->postSend = ps->postRecv = 0;
+ 
+    if (stage == 3) {
+      flags |= PatSkipped; ps->last = 2;
+    } else if (stage == 0) {
+      // own block -> its natural position (local copy, no-op if in place)
+      const size_t eo = g.offset + (size_t)e * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      ps->inpIx = eo;
+      ps->outIx = (size_t)rank * g.count + eo;
+      e++;
+      if (e >= g.nChunks) {
+        if (g.S == 0) stage = 2;
+        else { stage = 1; enterStep(0); }
+      }
+    } else {
+      const int len = (int)bmin(g.P, total - (size_t)gi * g.P);
+      const size_t q = (size_t)gi * g.P + k;
+      const int j = (int)(q % span);
+      const size_t eo = g.offset + (q / span) * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      const int off = k * g.stride;
+      const int post = (k == len - 1) ? 1 : 0;
+      if (half == 0) {                              // send window block from the output buffer
+        const size_t blk = (size_t)((sendStart + j) & mask);
+        ps->sendDim = dim;
+        ps->inpIx = ps->outIx = blk * g.count + eo;
+        ps->sendOffset = off; ps->postSend = post; flags |= PatSrcOutput;
+      } else {                                      // recv adjacent window block into the output buffer
+        const size_t blk = (size_t)((recvStart + j) & mask);
+        ps->recvDim = dim;
+        ps->outIx = blk * g.count + eo;
+        ps->recvOffset = off; ps->postRecv = post;
+      }
+      if (++k == len) {
+        k = 0;
+        if (half == 0) half = 1;
+        else {
+          half = 0;
+          if (++gi == nSlots) { if (s + 1 < g.S) enterStep(s + 1); else stage = 2; }
+        }
+      }
+    }
+    if (stage == 2) ps->last = 2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+    cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
+    a.store(flags, cuda::memory_order_release);
+#else
+    ps->flags = flags;
+#endif
+  }
+};
+
+class BineAGBlockByBlockAlgorithm {
+  BineAgGeom g; int rank, myIdx; const int* order;
+  int stage;                 // 0 local copy, 1 butterfly, 2 done, 3 empty channel
+  int e, half;
+  int s, gi, k, span, sendBeg, recvBeg, nSlots; size_t total;
+
+  __device__ __host__ static size_t bmin(size_t a, size_t b) { return a < b ? a : b; }
+
+  __device__ __host__ void enterStep(int step) {
+    s = step; span = 1 << s;
+    const int blockSize = span << 1;
+    const int base = (myIdx / blockSize) * blockSize;
+    const bool keepLower = ((myIdx >> s) & 1) == 0;
+    sendBeg = keepLower ? base : base + span;
+    recvBeg = keepLower ? base + span : base;
+    total  = (size_t)g.nChunks << s;
+    nSlots = g.stepSlots(s);
+    gi = 0; k = 0; half = 0;
+  }
+
+public:
+  __device__ __host__ BineAGBlockByBlockAlgorithm(const BineAgGeom& g_, int rank_, int myIdx_,
+                                                  const int* order_)
+      : g(g_), rank(rank_), myIdx(myIdx_), order(order_),
+        stage(g_.nChunks == 0 ? 3 : 0), e(0), half(0),
+        s(0), gi(0), k(0), span(1), sendBeg(0), recvBeg(0), nSlots(0), total(0) {}
+
+  __device__ __host__ int getParallelFactor() const { return 1; }
+
+  __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
+    int flags = PatUsed;
+    ps->last = 0; ps->nelem = 0; ps->inpIx = ps->outIx = 0;
+    ps->sendDim = ps->recvDim = -1; ps->sendOffset = ps->recvOffset = -1;
+    ps->stepOffset = 0; ps->postSend = ps->postRecv = 0;
+
+    if (stage == 3) {
+      flags |= PatSkipped; ps->last = 2;
+    } else if (stage == 0) {                        // own block -> slot `rank`
+      const size_t eo = g.offset + (size_t)e * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      ps->inpIx = eo;
+      ps->outIx = (size_t)rank * g.count + eo;
+      e++;
+      if (e >= g.nChunks) {
+        if (g.S == 0) stage = 2;
+        else { stage = 1; enterStep(0); }
+      }
+    } else {
+      const int len = (int)bmin(g.P, total - (size_t)gi * g.P);
+      const size_t q = (size_t)gi * g.P + k;
+      const int j = (int)(q % span);
+      const size_t eo = g.offset + (q / span) * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      const int off = k * g.stride;
+      const int post = (k == len - 1) ? 1 : 0;
+      if (half == 0) {                              // send block at position sendBeg+j
+        const size_t blk = (size_t)bineSendOrder(order, sendBeg + j, g.S);
+        ps->sendDim = s;
+        ps->inpIx = ps->outIx = blk * g.count + eo;
+        ps->sendOffset = off; ps->postSend = post; flags |= PatSrcOutput;
+      } else {                                      // recv block at position recvBeg+j
+        const size_t blk = (size_t)bineSendOrder(order, recvBeg + j, g.S);
+        ps->recvDim = s;
+        ps->outIx = blk * g.count + eo;
+        ps->recvOffset = off; ps->postRecv = post;
+      }
+      if (++k == len) {
+        k = 0;
+        if (half == 0) half = 1;
+        else {
+          half = 0;
+          if (++gi == nSlots) { if (s + 1 < g.S) enterStep(s + 1); else stage = 2; }
+        }
+      }
+    }
+    if (stage == 2) ps->last = 2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+    cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
+    a.store(flags, cuda::memory_order_release);
+#else
+    ps->flags = flags;
+#endif
+  }
+};
+
+class BineAGPermutationAlgorithm {
+  BineAgGeom g; int myIdx;
+  int stage;                 // 0 local copy, 1 butterfly, 2 done, 3 empty channel
+  int e, half;               // stage-0 chunk cursor / send-recv phase
+  int s, gi, k, span, sendBeg, recvBeg, nSlots; size_t total;
+
+  __device__ __host__ static size_t bmin(size_t a, size_t b) { return a < b ? a : b; }
+
+  __device__ __host__ void enterStep(int step) {
+    s = step; span = 1 << s;
+    const int blockSize = span << 1;
+    const int base = (myIdx / blockSize) * blockSize;
+    const bool keepLower = ((myIdx >> s) & 1) == 0;
+    sendBeg = keepLower ? base : base + span;       // I send the half I hold
+    recvBeg = keepLower ? base + span : base;       // and receive the other half
+    total  = (size_t)g.nChunks << s;
+    nSlots = g.stepSlots(s);
+    gi = 0; k = 0; half = 0;
+  }
+
+public:
+  __device__ __host__ BineAGPermutationAlgorithm(const BineAgGeom& g_, int myIdx_)
+      : g(g_), myIdx(myIdx_), stage(g_.nChunks == 0 ? 3 : 0), e(0), half(0),
+        s(0), gi(0), k(0), span(1), sendBeg(0), recvBeg(0), nSlots(0), total(0) {}
+
+  __device__ __host__ int getParallelFactor() const { return 1; }  // single group, as the others
+
+  __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
+    int flags = PatUsed;
+    ps->last = 0; ps->nelem = 0; ps->inpIx = ps->outIx = 0;
+    ps->sendDim = ps->recvDim = -1; ps->sendOffset = ps->recvOffset = -1;
+    ps->stepOffset = 0; ps->postSend = ps->postRecv = 0;
+
+    if (stage == 3) {
+      flags |= PatSkipped; ps->last = 2;
+    } else if (stage == 0) {                        // own block -> position myIdx
+      const size_t eo = g.offset + (size_t)e * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      ps->inpIx = eo;
+      ps->outIx = (size_t)myIdx * g.count + eo;
+      e++;
+      if (e >= g.nChunks) {
+        if (g.S == 0) stage = 2;
+        else { stage = 1; enterStep(0); }
+      }
+    } else {
+      const int len = (int)bmin(g.P, total - (size_t)gi * g.P);
+      const size_t q = (size_t)gi * g.P + k;
+      const int j = (int)(q % span);
+      const size_t eo = g.offset + (q / span) * g.chunk;
+      ps->nelem = (int)bmin(g.chunk, g.end - eo);
+      const int off = k * g.stride;
+      const int post = (k == len - 1) ? 1 : 0;
+      if (half == 0) {                              // send position sendBeg+j from the output buffer
+        ps->sendDim = s;
+        ps->inpIx = ps->outIx = (size_t)(sendBeg + j) * g.count + eo;
+        ps->sendOffset = off; ps->postSend = post; flags |= PatSrcOutput;
+      } else {                                      // recv position recvBeg+j into the output buffer
+        ps->recvDim = s;
+        ps->outIx = (size_t)(recvBeg + j) * g.count + eo;
+        ps->recvOffset = off; ps->postRecv = post;
+      }
+      if (++k == len) {
+        k = 0;
+        if (half == 0) half = 1;
+        else {
+          half = 0;
+          if (++gi == nSlots) { if (s + 1 < g.S) enterStep(s + 1); else stage = 2; }
+        }
+      }
+    }
+    if (stage == 2) ps->last = 2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+    cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
+    a.store(flags, cuda::memory_order_release);
+#else
+    ps->flags = flags;
+#endif
+  }
+};

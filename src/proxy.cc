@@ -936,8 +936,90 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
         return ncclSuccess;
       }
     }
-    case PERMUTATION :
+    case PERMUTATION : {
+        // XXX: Temporary hack to work with PAT impl.
+        if (channel->binePartner == nullptr || channel->bineIndex == nullptr) {
+          WARN("BINE index/partner tables are missing for PERMUTATION");
+          return ncclInternalError;
+        }
+        const int myIdx = bineSendIndex(channel->bineIndex, rank, doublingSteps);
+        BineAgGeom g;
+        g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
+               op->bineChunkCount, op->bineSlotElems);
+        BineAGPermutationAlgorithm algo(g, myIdx);
+
+        int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
+        struct ncclPatStep ps = {0};
+        do {
+          algo.getNextOp(&ps);
+          if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
+          if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
+          if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
+        } while (ps.last != 2);
+
+        // One step per dimension -> one recv and one send op per connection.
+        // The final permutation is local: no proxy ops for it.
+        for (int d = 0; d < doublingSteps; ++d) {
+          if (!nRecv[d] && !nSend[d]) continue;
+          const int partner = bineSendPartner(channel->binePartner, rank, d, doublingSteps);
+          if (partner < 0 || partner == rank) {
+            WARN("BINE PERMUTATION: invalid partner %d for dim %d", partner, d);
+            return ncclInternalError;
+          }
+          if (nRecv[d]) {
+            op->nsteps = nRecv[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          }
+          if (nSend[d]) {
+            op->nsteps = nSend[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+          }
+        }
+        break;   // common tail restores op->nsteps = savedNsteps INFO: std PERMUTATION should go on bbb path
+    }
     case BLOCK_BY_BLOCK: {
+      // XXX: Temporary hack to work with PAT impl.
+      if (op->coll == ncclFuncAllGather) {
+        if (channel->binePartner == nullptr || channel->bineIndex == nullptr ||
+            channel->bineOrder == nullptr) {
+          WARN("BINE index/order/partner tables are missing for BLOCK_BY_BLOCK");
+          return ncclInternalError;
+        }
+        const int myIdx = bineSendIndex(channel->bineIndex, rank, doublingSteps);
+        BineAgGeom g;
+        g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
+               op->bineChunkCount, op->bineSlotElems);
+        BineAGBlockByBlockAlgorithm algo(g, rank, myIdx, channel->bineOrder);
+
+        int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
+        struct ncclPatStep ps = {0};
+        do {
+          algo.getNextOp(&ps);
+          if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
+          if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
+          if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
+        } while (ps.last != 2);
+
+        // One step per dimension -> one recv and one send op per connection.
+        for (int d = 0; d < doublingSteps; ++d) {
+          if (!nRecv[d] && !nSend[d]) continue;
+          const int partner = bineSendPartner(channel->binePartner, rank, d, doublingSteps);
+          if (partner < 0 || partner == rank) {
+            WARN("BINE BLOCK_BY_BLOCK: invalid partner %d for dim %d", partner, d);
+            return ncclInternalError;
+          }
+          if (nRecv[d]) {
+            op->nsteps = nRecv[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          }
+          if (nSend[d]) {
+            op->nsteps = nSend[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+          }
+        }
+        break;   // common tail restores op->nsteps = savedNsteps
+      }
+
       // AG: kernel step s ascending. RS: paper step j ascending = kernel step steps-1-j, i.e. s descending.
       const bool isRS = (op->coll == ncclFuncReduceScatter);
       for (int i = 0; i < doublingSteps; ++i) {
@@ -955,6 +1037,44 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
     case DOUBLE_SEND: {
       const bool isRS = (op->coll == ncclFuncReduceScatter);
       const bool isAG = (op->coll == ncclFuncAllGather);
+
+      // XXX: Temporary hack to work with PAT impl.
+      if (isAG) {
+        BineAgGeom g;
+        g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
+               op->bineChunkCount, op->bineSlotElems);
+        BineAGDoubleSendAlgorithm algo(g, rank);
+
+        int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
+        struct ncclPatStep ps = {0};
+        do {
+          algo.getNextOp(&ps);
+          if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
+          if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
+          if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
+        } while (ps.last != 2);
+
+        // One step per dimension, so each connection sees exactly one op.
+        // Dim d is connected to dhlvBinePartner[rank*S + d] (same table the kernel uses).
+        for (int d = 0; d < doublingSteps; ++d) {
+          const int partner = channel->dhlvBinePartner[rank * doublingSteps + d];
+          if (!nRecv[d] && !nSend[d]) continue;
+          if (partner < 0 || partner == rank) {
+            WARN("BINE DOUBLE_SEND: invalid partner %d for dim %d", partner, d);
+            return ncclInternalError;
+          }
+          if (nRecv[d]) {
+            op->nsteps = nRecv[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          }
+          if (nSend[d]) {
+            op->nsteps = nSend[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+          }
+        }
+        break;   // common tail restores op->nsteps = savedNsteps
+      }
+
       if (!isRS && !isAG) {
         WARN("BINE DOUBLE_SEND is only implemented for ReduceScatter/AllGather");
         return ncclInternalError;
