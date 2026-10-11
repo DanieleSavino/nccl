@@ -167,6 +167,11 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
         arEnabled && buffMan == SEND && doublingSteps > 0 && channel->binePartner != nullptr;
     // TREE: pipelined reduce+bcast on one fixed-root tree per channel.
     const bool arTreeOk = arEnabled && hasStepTables && steps <= BINE_AR_MAX_FAN;
+    const bool agTreeOk = agEnabled && buffMan == TREE && hasStepTables &&
+                           steps <= BINE_AR_MAX_FAN && (1 << steps) == nRanks;
+
+    const bool rsTreeOk = rsEnabled && buffMan == TREE && hasStepTables &&
+                           steps <= BINE_AR_MAX_FAN && (1 << steps) == nRanks;
     // Legacy all-roots tree for AR, only if neither new variant covers it.
     const bool arNeedsTree = arEnabled && !arRsagOk && !arTreeOk;
  
@@ -175,7 +180,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     const bool enableDoublingPhase  = hasDoublingTables && (rsEnabled || agEnabled || arEnabled);
     const bool enableRedistribution = enableDoublingPhase && buffMan == SEND && (agEnabled || rsEnabled);
  
-    if (!(enableBroadcastPhase || enableReducePhase || enableDoublingPhase || arTreeOk)) {
+    if (!(enableBroadcastPhase || enableReducePhase || enableDoublingPhase || arTreeOk || agTreeOk || rsTreeOk)) {
       INFO(NCCL_INIT, "BINE channel %d: all phases disabled", c);
       continue;
     }
@@ -209,7 +214,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
  
     // ---- AR TREE variant: only this channel's root. Bidirectional on every
     //      neighbour (reduce uses child->parent, bcast uses parent->child). ----
-    if (arTreeOk) {
+    if (arTreeOk || agTreeOk || rsTreeOk) {
       const int root = ncclBineArRoot(c, nRanks);
       int children[BINE_AR_MAX_FAN];
       int nChildren, parent;

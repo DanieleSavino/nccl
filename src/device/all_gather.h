@@ -472,6 +472,132 @@ __device__ __forceinline__ void runBinePermutation(int tid, int nthreads,
       [&](int b) { return bineSendIndex(idxTbl, b, steps); },
       nRanks, count, gridOffset, channelCount);
 }
+
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int nSteps = bine->nSteps;
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank   = ncclShmem.comm.rank;
+ 
+  // blockStride = elements per rank (stride between blocks in recvbuff), from `count`.
+  ssize_t blockStride, gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &blockStride,
+                  &gridOffset, &channelCount, &chunkCount);
+  if (channelCount == 0) return;   // proxy registers nothing for empty channels
+ 
+  const int root = ncclBineArRoot(ncclShmem.channelId, nRanks);
+  int children[BINE_AR_MAX_FAN];
+  int nChildren;
+  ncclBineTreeChildrenOf(bine->send, nRanks, nSteps, root, rank, BINE_AR_MAX_FAN, children, &nChildren);
+  const int parent = ncclBineTreeParentOf(bine->recv, nRanks, nSteps, root, rank);
+ 
+  T* recvbuff = (T*)work->recvbuff;
+  const T* sendbuff = (const T*)work->sendbuff;
+ 
+  // Degenerate: single rank.
+  if (nRanks == 1) {
+    if (sendbuff != recvbuff)
+      for (ssize_t e = tid; e < channelCount; e += nthreads)
+        recvbuff[gridOffset + e] = sendbuff[gridOffset + e];
+    return;
+  }
+ 
+  // Copy my own chunk into its slot of recvbuff (skipped for in-place).
+  auto copyOwn = [&](ssize_t off, int nelem, int t, int nt) {
+    T* dst = recvbuff + (ssize_t)rank * blockStride + off;
+    const T* src = sendbuff + off;
+    if (src != dst)
+      for (int i = t; i < nelem; i += nt) dst[i] = src[i];
+  };
+ 
+  // Receive the subtree of every child into recvbuff, one Primitives per child (each child has
+  // its own destination offsets, a multi-peer recv would reduce into ONE destination).
+  auto gatherFromChildren = [&](ssize_t off, int nelem, int t, int nt, int group) {
+    for (int i = 0; i < nChildren; ++i) {
+      Primitives<T, RedOp, FanAsymmetric<1, 0>, /*Direct=*/0, Proto, 0>
+          prims(t, nt, &children[i], nullptr, work->sendbuff, work->recvbuff,
+                work->redOpArg, group, 0, 0, work);
+      ncclBinePreorder it;
+      it.init(bine->send, bine->recv, nRanks, nSteps, root, children[i]);
+      int b;
+      while (it.next(&b)) prims.recv((ssize_t)b * blockStride + off, nelem);
+    }
+  };
+ 
+  // ---------------- root: gather everything, then bcast it ----------------
+  if (parent < 0) {
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+ 
+      copyOwn(off, nelem, tid, nthreads);
+      gatherFromChildren(off, nelem, tid, nthreads, 0);
+      {
+        // Sends read from recvbuff (the group barrier inside the first send orders it after the
+        // local copy / recvs above).
+        Primitives<T, RedOp, FanAsymmetric<0, BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+            prims(tid, nthreads, nullptr, children, work->recvbuff, work->recvbuff,
+                  work->redOpArg, 0, 0, 0, work);
+        for (int b = 0; b < nRanks; ++b)
+          prims.send((ssize_t)b * blockStride + off, nelem);
+      }
+    }
+    return;
+  }
+ 
+  // ---------------- non-root: split threads (same split as runBineTree) ----------------
+  int nthreadsSplit;
+  if (Proto::Id == NCCL_PROTO_SIMPLE) {
+    nthreadsSplit = nthreads / 2;
+    if (nthreadsSplit >= 256) nthreadsSplit += 64;
+  } else {
+    nthreadsSplit = (nthreads * 7 / (10 * WARP_SIZE)) * WARP_SIZE;
+  }
+ 
+  if (tid < nthreadsSplit) {
+    // ---- GATHER: recv subtree of each child, send my whole subtree to the parent ----
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+ 
+      if (nChildren == 0) {
+        // Leaf: send own chunk straight from sendbuff (no copy needed).
+        Primitives<T, RedOp, FanAsymmetric<0, 1>, /*Direct=*/0, Proto, 0>
+            prims(tid, nthreadsSplit, nullptr, &parent, work->sendbuff, work->recvbuff,
+                  work->redOpArg, 0 * Proto::MaxGroupWidth, 0, 0, work);
+        prims.send(off, nelem);
+      } else {
+        copyOwn(off, nelem, tid, nthreadsSplit);
+        gatherFromChildren(off, nelem, tid, nthreadsSplit, 0 * Proto::MaxGroupWidth);
+        Primitives<T, RedOp, FanAsymmetric<0, 1>, /*Direct=*/0, Proto, 0>
+            prims(tid, nthreadsSplit, nullptr, &parent, work->recvbuff, work->recvbuff,
+                  work->redOpArg, 0 * Proto::MaxGroupWidth, 0, 0, work);
+        ncclBinePreorder it;
+        it.init(bine->send, bine->recv, nRanks, nSteps, root, rank);
+        int b;
+        while (it.next(&b)) prims.send((ssize_t)b * blockStride + off, nelem);
+      }
+    }
+  } else {
+    // ---- BCAST: recv every block from the parent, write it, forward to the children ----
+    // Writes the same bytes the gather group already placed in recvbuff (benign overlap), and
+    // can only reach this rank after the gather of the same chunk has left it.
+    Primitives<T, RedOp, FanAsymmetric<1, BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+        prims(tid - nthreadsSplit, nthreads - nthreadsSplit, &parent, children,
+              work->sendbuff, work->recvbuff, work->redOpArg,
+              1 * Proto::MaxGroupWidth, 0, 0, work);
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+      if (nChildren == 0) {
+        for (int b = 0; b < nRanks; ++b) prims.recv((ssize_t)b * blockStride + off, nelem);
+      } else {
+        for (int b = 0; b < nRanks; ++b) prims.recvCopySend((ssize_t)b * blockStride + off, nelem);
+      }
+    }
+  }
+}
 } // namespace
 
 template <typename T, typename RedOp>
@@ -1077,6 +1203,9 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE,
       break;
     case SEND:
       runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+      break;
+    case TREE:
+      runBineTree<T, RedOp, Proto>(tid, nthreads, work);
       break;
     default:
       assert(false && "Invalid Bine buffer management");

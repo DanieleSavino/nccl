@@ -571,6 +571,116 @@ __device__ __forceinline__ void runBinePermutation(int tid, int nthreads, ncclDe
       outputBuf[gridOffset + e] = mySeg[gridOffset + e];
   }
 }
+
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkColl* work) {
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int nSteps = bine->nSteps;
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank   = ncclShmem.comm.rank;
+ 
+  // blockStride = elements per rank (stride between blocks in sendbuff), from `count`.
+  ssize_t blockStride, gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &blockStride,
+                  &gridOffset, &channelCount, &chunkCount);
+  if (channelCount == 0) return;   // proxy registers nothing for empty channels
+ 
+  // Degenerate: single rank.
+  if (nRanks == 1) {
+    const T* in = (const T*)work->sendbuff;
+    T* out = (T*)work->recvbuff;
+    if (in != out)
+      for (ssize_t e = tid; e < channelCount; e += nthreads)
+        out[gridOffset + e] = in[gridOffset + e];
+    return;
+  }
+ 
+  const int root = ncclBineArRoot(ncclShmem.channelId, nRanks);
+  int children[BINE_AR_MAX_FAN];     // ascending step order, -1 padded
+  int nChildren;
+  ncclBineTreeChildrenOf(bine->send, nRanks, nSteps, root, rank, BINE_AR_MAX_FAN, children, &nChildren);
+  const int parent = ncclBineTreeParentOf(bine->recv, nRanks, nSteps, root, rank);
+ 
+  // ---------------- root: fused reduce + scatter ----------------
+  if (parent < 0) {
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+ 
+      // Position 0 of the preorder: the root's own block.
+      {
+        Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 0>, /*Direct=*/0, Proto, 0>
+            prims(tid, nthreads, children, nullptr, work->sendbuff, work->recvbuff,
+                  work->redOpArg, 0, 0, 0, work);
+        prims.recvReduceCopy((ssize_t)rank * blockStride + off, off, nelem, /*postOp=*/true);
+      }
+      // Then preorder(child) for each root child, reduced from ALL children, sent to that child.
+      for (int i = 0; i < nChildren; ++i) {
+        Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 1>, /*Direct=*/0, Proto, 0>
+            prims(tid, nthreads, children, &children[i], work->sendbuff, work->recvbuff,
+                  work->redOpArg, 0, 0, 0, work);
+        ncclBinePreorder it;
+        it.init(bine->send, bine->recv, nRanks, nSteps, root, children[i]);
+        int b;
+        while (it.next(&b))
+          prims.recvReduceSend((ssize_t)b * blockStride + off, nelem, /*postOp=*/true);
+      }
+    }
+    return;
+  }
+ 
+  // ---------------- non-root: split threads (same split as runBineTree) ----------------
+  int nthreadsSplit;
+  if (Proto::Id == NCCL_PROTO_SIMPLE) {
+    nthreadsSplit = nthreads / 2;
+    if (nthreadsSplit >= 256) nthreadsSplit += 64;
+  } else {
+    nthreadsSplit = (nthreads * 7 / (10 * WARP_SIZE)) * WARP_SIZE;
+  }
+ 
+  if (tid < nthreadsSplit) {
+    // ---- REDUCE up: all nRanks blocks, global preorder ----
+    Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 1>, /*Direct=*/0, Proto, 0>
+        prims(tid, nthreadsSplit, children, &parent, work->sendbuff, work->recvbuff,
+              work->redOpArg, 0 * Proto::MaxGroupWidth, 0, 0, work);
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+      ncclBinePreorder it;
+      it.init(bine->send, bine->recv, nRanks, nSteps, root, root);
+      int b;
+      while (it.next(&b)) {
+        const ssize_t in = (ssize_t)b * blockStride + off;
+        if (nChildren == 0) prims.send(in, nelem);
+        else                prims.recvReduceSend(in, nelem);
+      }
+    }
+  } else {
+    // ---- SCATTER down: preorder(rank) = own block, then each child's preorder ----
+    const int t = tid - nthreadsSplit;
+    const int nt = nthreads - nthreadsSplit;
+    int cCount[BINE_AR_MAX_FAN];
+    for (int i = 0; i < BINE_AR_MAX_FAN; ++i)
+      cCount[i] = (i < nChildren) ? ncclBineTreeSubtreeSize(bine->recv, nRanks, nSteps, root, children[i]) : 0;
+ 
+    for (ssize_t e = 0; e < channelCount; e += chunkCount) {
+      const ssize_t off = gridOffset + e;
+      const int nelem = (int)min(chunkCount, channelCount - e);
+      {
+        Primitives<T, RedOp, FanAsymmetric<1, 0>, /*Direct=*/0, Proto, 0>
+            prims(t, nt, &parent, nullptr, work->sendbuff, work->recvbuff,
+                  work->redOpArg, 1 * Proto::MaxGroupWidth, 0, 0, work);
+        prims.recv(off, nelem);                       // my reduced block -> recvbuff
+      }
+      for (int i = 0; i < nChildren; ++i) {
+        Primitives<T, RedOp, FanAsymmetric<1, 1>, /*Direct=*/0, Proto, 0>
+            prims(t, nt, &parent, &children[i], work->sendbuff, work->recvbuff,
+                  work->redOpArg, 1 * Proto::MaxGroupWidth, 0, 0, work);
+        for (int k = 0; k < cCount[i]; ++k) prims.recvSend(nelem);   // pure relay
+      }
+    }
+  }
+}
 }
 
 template<typename T, typename RedOp>
@@ -1051,6 +1161,9 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_S
         break;
       case SEND:
         runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+        break;
+      case TREE:
+        runBineTree<T, RedOp, Proto>(tid, nthreads, work);
         break;
       default:
         assert(false && "Invalid Bine buffer management");

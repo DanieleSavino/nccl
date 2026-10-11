@@ -670,6 +670,163 @@ static ncclResult_t SaveProxy(struct ncclComm *comm,
   return ncclSuccess;
 }
 
+static ncclResult_t SaveProxyBineRsTree(struct ncclComm* comm, struct ncclChannel* channel,
+                                        struct ncclProxyOp* op, bool* justInquire,
+                                        int nLoops, int chunkSteps) {
+  const int nRanks = comm->nRanks;
+  const int rank = comm->rank;
+  const int steps = channel->bine.nSteps;
+  if (steps == 0 || channel->bineSend == nullptr || channel->bineRecv == nullptr) {
+    WARN("BINE RS tree requested but send/recv tables are missing (channel %d)", channel->id);
+    return ncclInternalError;
+  }
+  if (steps > BINE_AR_MAX_FAN) {
+    WARN("BINE RS tree: %d steps exceeds max fan %d", steps, BINE_AR_MAX_FAN);
+    return ncclInternalError;
+  }
+  if ((1 << steps) != nRanks) {
+    WARN("BINE RS tree requires nRanks == 2^steps (nRanks %d, steps %d)", nRanks, steps);
+    return ncclInternalError;
+  }
+ 
+  const int root = ncclBineArRoot(channel->id, nRanks);
+  const int* sendTbl = channel->bineSend;
+  const int* recvTbl = channel->bineRecv;
+ 
+  // Same helpers as the kernel -> same tree, same order.
+  int children[BINE_AR_MAX_FAN];
+  int nChildren;
+  ncclBineTreeChildrenOf(sendTbl, nRanks, steps, root, rank, BINE_AR_MAX_FAN, children, &nChildren);
+  const int parent = ncclBineTreeParentOf(recvTbl, nRanks, steps, root, rank);
+  const int ownCount = ncclBineTreeSubtreeSize(recvTbl, nRanks, steps, root, rank);
+ 
+  // Sanity: the transport connects the neighbours given by ncclBineArTreeNeighbors.
+  {
+    int tbl[BINE_AR_MAX_FAN], nTbl, tblParent;
+    ncclBineArTreeNeighbors(sendTbl, recvTbl, nRanks, steps, root, rank, tbl, &nTbl, &tblParent);
+    bool same = (nTbl == nChildren) && (tblParent == parent);
+    for (int i = 0; same && i < nChildren; ++i) {
+      bool found = false;
+      for (int k = 0; k < nTbl; ++k) found |= (tbl[k] == children[i]);
+      same = found;
+    }
+    if (!same) {
+      WARN("BINE RS tree: neighbours differ from ncclBineArTreeNeighbors (rank %d channel %d)",
+           rank, channel->id);
+      return ncclInternalError;
+    }
+  }
+ 
+  int childCount[BINE_AR_MAX_FAN];
+  int sum = 1;
+  for (int i = 0; i < nChildren; ++i) {
+    childCount[i] = ncclBineTreeSubtreeSize(recvTbl, nRanks, steps, root, children[i]);
+    sum += childCount[i];
+  }
+  if (sum != ownCount) {
+    WARN("BINE RS tree: subtree size mismatch on rank %d channel %d (%d != %d)",
+         rank, channel->id, sum, ownCount);
+    return ncclInternalError;
+  }
+ 
+  const int savedNsteps = op->nsteps;
+  const int reduceSteps = nRanks * nLoops * chunkSteps;   // full vector goes up, one block/step
+ 
+  for (int i = 0; i < nChildren; ++i) {
+    op->nsteps = reduceSteps;                             // reduce: recv child's partial vector
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, children[i], op, 0, justInquire));
+    op->nsteps = childCount[i] * nLoops * chunkSteps;     // scatter: send child's subtree blocks
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, children[i], op, 0, justInquire));
+  }
+  if (parent >= 0) {
+    op->nsteps = reduceSteps;                             // reduce: send my partial vector
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, parent, op, 0, justInquire));
+    op->nsteps = ownCount * nLoops * chunkSteps;          // scatter: recv my subtree blocks
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, parent, op, 0, justInquire));
+  }
+  op->nsteps = savedNsteps;
+  return ncclSuccess;
+}
+
+static ncclResult_t SaveProxyBineAgTree(struct ncclComm* comm, struct ncclChannel* channel,
+                                        struct ncclProxyOp* op, bool* justInquire,
+                                        int nLoops, int chunkSteps) {
+  const int nRanks = comm->nRanks;
+  const int rank = comm->rank;
+  const int steps = channel->bine.nSteps;
+  if (steps == 0 || channel->bineSend == nullptr || channel->bineRecv == nullptr) {
+    WARN("BINE AG tree requested but send/recv tables are missing (channel %d)", channel->id);
+    return ncclInternalError;
+  }
+  if (steps > BINE_AR_MAX_FAN) {
+    WARN("BINE AG tree: %d steps exceeds max fan %d", steps, BINE_AR_MAX_FAN);
+    return ncclInternalError;
+  }
+  if ((1 << steps) != nRanks) {
+    WARN("BINE AG tree requires nRanks == 2^steps (nRanks %d, steps %d)", nRanks, steps);
+    return ncclInternalError;
+  }
+ 
+  const int root = ncclBineArRoot(channel->id, nRanks);
+  const int* sendTbl = channel->bineSend;
+  const int* recvTbl = channel->bineRecv;
+ 
+  // Same helpers as the kernel -> same tree, same order.
+  int children[BINE_AR_MAX_FAN];
+  int nChildren;
+  ncclBineTreeChildrenOf(sendTbl, nRanks, steps, root, rank, BINE_AR_MAX_FAN, children, &nChildren);
+  const int parent = ncclBineTreeParentOf(recvTbl, nRanks, steps, root, rank);
+  const int ownCount = ncclBineTreeSubtreeSize(recvTbl, nRanks, steps, root, rank);
+ 
+  // Sanity: the transport connects the neighbours given by ncclBineArTreeNeighbors; make sure
+  // they are the ones the kernel talks to.
+  {
+    int tbl[BINE_AR_MAX_FAN], nTbl, tblParent;
+    ncclBineArTreeNeighbors(sendTbl, recvTbl, nRanks, steps, root, rank, tbl, &nTbl, &tblParent);
+    bool same = (nTbl == nChildren) && (tblParent == parent);
+    for (int i = 0; same && i < nChildren; ++i) {
+      bool found = false;
+      for (int k = 0; k < nTbl; ++k) found |= (tbl[k] == children[i]);
+      same = found;
+    }
+    if (!same) {
+      WARN("BINE AG tree: neighbours differ from ncclBineArTreeNeighbors (rank %d channel %d)",
+           rank, channel->id);
+      return ncclInternalError;
+    }
+  }
+ 
+  int childCount[BINE_AR_MAX_FAN];
+  int sum = 1;
+  for (int i = 0; i < nChildren; ++i) {
+    childCount[i] = ncclBineTreeSubtreeSize(recvTbl, nRanks, steps, root, children[i]);
+    sum += childCount[i];
+  }
+  if (sum != ownCount) {
+    WARN("BINE AG tree: subtree size mismatch on rank %d channel %d (%d != %d)",
+         rank, channel->id, sum, ownCount);
+    return ncclInternalError;
+  }
+ 
+  const int savedNsteps = op->nsteps;
+  const int bcastSteps = nRanks * nLoops * chunkSteps;   // full buffer, one block per step
+ 
+  for (int i = 0; i < nChildren; ++i) {
+    op->nsteps = childCount[i] * nLoops * chunkSteps;    // gather: recv child's subtree
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, children[i], op, 0, justInquire));
+    op->nsteps = bcastSteps;                             // bcast: send everything
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, children[i], op, 0, justInquire));
+  }
+  if (parent >= 0) {
+    op->nsteps = ownCount * nLoops * chunkSteps;         // gather: send my subtree
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, parent, op, 0, justInquire));
+    op->nsteps = bcastSteps;                             // bcast: recv everything
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, parent, op, 0, justInquire));
+  }
+  op->nsteps = savedNsteps;
+  return ncclSuccess;
+}
+
 static ncclResult_t SaveProxyBineArTree(struct ncclComm* comm, struct ncclChannel* channel,
                                         struct ncclProxyOp* op, bool* justInquire) {
   const int nRanks = comm->nRanks;
@@ -764,6 +921,17 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
     case TREE: {
       if(op->coll == ncclFuncAllReduce) {
         NCCLCHECK(SaveProxyBineArTree(comm, channel, op, justInquire));
+        op->nsteps = savedNsteps;
+        return ncclSuccess;
+      }
+      else if(op->coll == ncclFuncAllGather) {
+        NCCLCHECK(SaveProxyBineAgTree(comm, channel, op, justInquire, nLoops, chunkSteps));
+        op->nsteps = savedNsteps;
+        return ncclSuccess;
+      }
+      else if(op->coll == ncclFuncReduceScatter) {
+        NCCLCHECK(SaveProxyBineRsTree(comm, channel, op, justInquire, nLoops, chunkSteps));
+        op->nsteps = savedNsteps;
         return ncclSuccess;
       }
     }

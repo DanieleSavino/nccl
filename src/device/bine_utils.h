@@ -93,7 +93,7 @@ static inline int is_pow_2(int num) {
  * @return     Full 32-bit negabinary encoding of @p rank,
  *             or @c -1 if @p rank is out of range.
  */
-static inline int rank2nb_raw(int32_t rank) {
+NCCL_HOST_DEVICE_INLINE int rank2nb_raw(int32_t rank) {
     if (rank > 0x55555555)
         return -1;
 
@@ -115,7 +115,7 @@ static inline int rank2nb_raw(int32_t rank) {
  * @return     The @p bits-bit negabinary encoding of @p rank,
  *             or @c -1 if @p rank exceeds the representable range.
  */
-static inline int rank2nb(int32_t rank, int bits) {
+NCCL_HOST_DEVICE_INLINE int rank2nb(int32_t rank, int bits) {
     const int size = (1 << bits);
     return rank2nb_raw(rank) & (size - 1);
 }
@@ -130,7 +130,7 @@ static inline int rank2nb(int32_t rank, int bits) {
  * @param nb Full 32-bit negabinary-encoded value.
  * @return   The corresponding signed MPI rank value.
  */
-static inline int nb2rank_raw(int32_t nb) {
+NCCL_HOST_DEVICE_INLINE int nb2rank_raw(int32_t nb) {
     const uint32_t mask = 0xAAAAAAAA;
     const int32_t val = (mask ^ nb) - mask;
     return val;
@@ -146,7 +146,7 @@ static inline int nb2rank_raw(int32_t nb) {
  * @param bits Number of bits defining the communicator size (@c 1 << @p bits).
  * @return     The MPI rank corresponding to @p nb within the @p bits-bit range.
  */
-static inline int nb2rank(int32_t nb, int bits) {
+NCCL_HOST_DEVICE_INLINE int nb2rank(int32_t nb, int bits) {
     const int size = (1 << bits);
     return nb2rank_raw(nb) & (size - 1);
 }
