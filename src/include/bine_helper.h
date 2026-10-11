@@ -19,7 +19,6 @@ typedef enum {
   PERMUTATION,
   DOUBLE_SEND,
   SEND,
-  TREE
 } ncclBineBufferManagement_t;
 
 static inline const char* ncclBineBufferManagementToString(ncclBineBufferManagement_t val) {
@@ -28,7 +27,6 @@ static inline const char* ncclBineBufferManagementToString(ncclBineBufferManagem
     case PERMUTATION:    return "PERMUTATION";
     case DOUBLE_SEND:    return "DOUBLE_SEND";
     case SEND:           return "SEND";
-    case TREE:           return "TREE";
     default:             return "UNKNOWN";
   }
 }
@@ -42,10 +40,37 @@ static inline ncclResult_t ncclBineBufferManagementFromString(const char* str, n
     *val = DOUBLE_SEND;
   } else if (strcmp(str, "SEND") == 0) {
     *val = SEND;
-  } else if (strcmp(str, "TREE") == 0) {
-    *val = TREE;
   } else {
     WARN("Unknown ncclBineBufferManagement_t value: %s", str);
+    return ncclInvalidArgument;
+  }
+  return ncclSuccess;
+}
+
+typedef enum {
+  TREE,
+  BUTTERFLY,
+  PAT,
+} ncclBineVariant_t;
+
+static inline const char* ncclBineVariantToString(ncclBineVariant_t val) {
+  switch (val) {
+    case TREE:     return "TREE";
+    case BUTTERFLY: return "BUTTERFLY";
+    case PAT:      return "PAT";
+    default:       return "UNKNOWN";
+  }
+}
+
+static inline ncclResult_t ncclBineVariantFromString(const char* str, ncclBineVariant_t* val) {
+  if (strcmp(str, "TREE") == 0) {
+    *val = TREE;
+  } else if (strcmp(str, "BUTTERFLY") == 0) {
+    *val = BUTTERFLY;
+  } else if (strcmp(str, "PAT") == 0) {
+    *val = PAT;
+  } else {
+    WARN("Unknown ncclBineVariant_t value: %s", str);
     return ncclInvalidArgument;
   }
   return ncclSuccess;

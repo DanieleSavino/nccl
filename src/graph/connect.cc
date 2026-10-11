@@ -327,16 +327,29 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
       ncclBineBufferManagement_t bineBufMgmt;
       bineBufMgmt = BLOCK_BY_BLOCK; // default
 
-      const char* str;
-      str = ncclGetEnv("NCCL_BINE_BUFFER_MANAGEMENT");
-      if (str == NULL) {
+      const char* str_buffman;
+      str_buffman = ncclGetEnv("NCCL_BINE_BUFFER_MANAGEMENT");
+      if (str_buffman == NULL) {
         WARN("NCCL_BINE_BUFFER_MANAGEMENT not set, defaulting to BLOCK_BY_BLOCK");
       }
       else {
-        ncclBineBufferManagementFromString(str, &bineBufMgmt);
+        ncclBineBufferManagementFromString(str_buffman, &bineBufMgmt);
+      }
+
+      ncclBineVariant_t bineVariant;
+      bineVariant = TREE; // default
+
+      const char* str_variant;
+      str_variant = ncclGetEnv("NCCL_BINE_VARIANT");
+      if (str_variant == NULL) {
+        WARN("NCCL_BINE_VARIANT not set, defaulting to TREE");
+      }
+      else {
+        ncclBineVariantFromString(str_variant, &comm->channels[c].bine.variant);
       }
 
       comm->channels[c].bine.bufferManagement = bineBufMgmt;
+      comm->channels[c].bine.variant = bineVariant;
     }
 
     INFO(NCCL_GRAPH,

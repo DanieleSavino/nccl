@@ -206,6 +206,7 @@ struct ncclBine {
   int* index;
   int* order;
   ncclBineBufferManagement_t bufferManagement;
+  ncclBineVariant_t variant;
 };
 
 #define NCCL_MAX_DIRECT_ARITY 7

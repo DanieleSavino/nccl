@@ -991,18 +991,20 @@ template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
     ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineVariant_t bineVar = bine->variant;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
 
     // Same chunkSteps=1 hack as the RS/AG specializations.
     using Proto = ProtoSimple<1, 1>;
 
-    if (bine->bufferManagement == SEND)
+    if (bufferManagement == SEND)
       runBineSend<T, RedOp, Proto>(tid, nthreads, work);
-    else if (bine->bufferManagement == TREE)
+    else if (bineVar == TREE)
       runBineTree<T, RedOp, Proto>(tid, nthreads, work);
     else {
       // Connect/SaveProxyBine only register the tree phases for non-SEND, so there is no
       // doubling connectivity here.
-      assert(false && "Bine AllReduce doubling path requires SEND buffer management");
+      assert(false && "Bine AllReduce doubling path requires SEND or TREE");
     }
   }
 };

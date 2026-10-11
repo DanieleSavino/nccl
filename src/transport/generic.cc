@@ -154,6 +154,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
     }
  
     const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
+    const ncclBineVariant_t bineVar = channel->bine.variant;
  
     if (buffMan == SEND && doublingSteps > 0 &&
         (channel->bineIndex == nullptr || channel->bineOrder == nullptr)) {
@@ -167,10 +168,10 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
         arEnabled && buffMan == SEND && doublingSteps > 0 && channel->binePartner != nullptr;
     // TREE: pipelined reduce+bcast on one fixed-root tree per channel.
     const bool arTreeOk = arEnabled && hasStepTables && steps <= BINE_AR_MAX_FAN;
-    const bool agTreeOk = agEnabled && buffMan == TREE && hasStepTables &&
+    const bool agTreeOk = agEnabled && bineVar == TREE && hasStepTables &&
                            steps <= BINE_AR_MAX_FAN && (1 << steps) == nRanks;
 
-    const bool rsTreeOk = rsEnabled && buffMan == TREE && hasStepTables &&
+    const bool rsTreeOk = rsEnabled && bineVar == TREE && hasStepTables &&
                            steps <= BINE_AR_MAX_FAN && (1 << steps) == nRanks;
     // Legacy all-roots tree for AR, only if neither new variant covers it.
     const bool arNeedsTree = arEnabled && !arRsagOk && !arTreeOk;

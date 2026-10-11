@@ -674,12 +674,15 @@ private:
       int rank = ncclShmem.comm.rank;
       int recvPeer = -1, sendPeer = -1;
       if (mode == primsModeBineAg) {
-        // dim s (< S): butterfly partner at kernel step s.  dim S: pre-step redistribution.
         ncclBine* bine = &ncclShmem.channel.bine;
         const int S = bine->nDoublingSteps;
+        const bool isDoubleSend = (bine->bufferManagement == DOUBLE_SEND);
+        const bool hasPreStep   = (bine->bufferManagement == SEND);
         if (tid < S) {
-          recvPeer = sendPeer = bineSendPartner(bine->partners, rank, tid, S);
-        } else if (tid == S) {
+          recvPeer = sendPeer = isDoubleSend
+              ? bine->dhlvPartners[rank * S + tid]
+              : bineSendPartner(bine->partners, rank, tid, S);
+        } else if (hasPreStep && tid == S) {
           BineAgPre pre = bineAgPre(bine->partners, bine->index, bine->order, rank, S);
           if (pre.recvDim == S) recvPeer = pre.recvPeer;   // only if not aliased to a partner dim
           if (pre.sendDim == S) sendPeer = pre.sendPeer;

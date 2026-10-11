@@ -862,6 +862,7 @@ static ncclResult_t SaveProxyBineArTree(struct ncclComm* comm, struct ncclChanne
 static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *channel,
                                   struct ncclProxyOp *op, bool *justInquire) {
   const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
+  const ncclBineVariant_t bineVar = channel->bine.variant;
   const int nRanks = comm->nRanks;
   if (nRanks <= 1) return ncclSuccess;
 
@@ -915,71 +916,72 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
     for (int peer : sendPeers) NCCLCHECK(SaveProxy(comm, channel, proxySend, peer, op, 0, justInquire));
   }
 
+  if(bineVar == TREE) {
+    if(op->coll == ncclFuncAllReduce) {
+      NCCLCHECK(SaveProxyBineArTree(comm, channel, op, justInquire));
+      op->nsteps = savedNsteps;
+      return ncclSuccess;
+    }
+    else if(op->coll == ncclFuncAllGather) {
+      NCCLCHECK(SaveProxyBineAgTree(comm, channel, op, justInquire, nLoops, chunkSteps));
+      op->nsteps = savedNsteps;
+      return ncclSuccess;
+    }
+    else if(op->coll == ncclFuncReduceScatter) {
+      NCCLCHECK(SaveProxyBineRsTree(comm, channel, op, justInquire, nLoops, chunkSteps));
+      op->nsteps = savedNsteps;
+      return ncclSuccess;
+    }
+  }
+
   // ---- Doubling phase ----
   // Kernel step s -> generic step doublingSteps-1-s (bineSendPartner). Kernel step s moves 2^s blocks.
   if (hasDoubling) {
     switch (buffMan) {
-    case TREE: {
-      if(op->coll == ncclFuncAllReduce) {
-        NCCLCHECK(SaveProxyBineArTree(comm, channel, op, justInquire));
-        op->nsteps = savedNsteps;
-        return ncclSuccess;
-      }
-      else if(op->coll == ncclFuncAllGather) {
-        NCCLCHECK(SaveProxyBineAgTree(comm, channel, op, justInquire, nLoops, chunkSteps));
-        op->nsteps = savedNsteps;
-        return ncclSuccess;
-      }
-      else if(op->coll == ncclFuncReduceScatter) {
-        NCCLCHECK(SaveProxyBineRsTree(comm, channel, op, justInquire, nLoops, chunkSteps));
-        op->nsteps = savedNsteps;
-        return ncclSuccess;
-      }
-    }
     case PERMUTATION : {
-        // XXX: Temporary hack to work with PAT impl.
-        if (channel->binePartner == nullptr || channel->bineIndex == nullptr) {
-          WARN("BINE index/partner tables are missing for PERMUTATION");
-          return ncclInternalError;
-        }
-        const int myIdx = bineSendIndex(channel->bineIndex, rank, doublingSteps);
-        BineAgGeom g;
-        g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
-               op->bineChunkCount, op->bineSlotElems);
-        BineAGPermutationAlgorithm algo(g, myIdx);
-
-        int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
-        struct ncclPatStep ps = {0};
-        do {
-          algo.getNextOp(&ps);
-          if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
-          if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
-          if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
-        } while (ps.last != 2);
-
-        // One step per dimension -> one recv and one send op per connection.
-        // The final permutation is local: no proxy ops for it.
-        for (int d = 0; d < doublingSteps; ++d) {
-          if (!nRecv[d] && !nSend[d]) continue;
-          const int partner = bineSendPartner(channel->binePartner, rank, d, doublingSteps);
-          if (partner < 0 || partner == rank) {
-            WARN("BINE PERMUTATION: invalid partner %d for dim %d", partner, d);
+	if(bineVar == PAT) {
+          if (channel->binePartner == nullptr || channel->bineIndex == nullptr) {
+            WARN("BINE index/partner tables are missing for PERMUTATION");
             return ncclInternalError;
           }
-          if (nRecv[d]) {
-            op->nsteps = nRecv[d];
-            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+          const int myIdx = bineSendIndex(channel->bineIndex, rank, doublingSteps);
+          BineAgGeom g;
+          g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
+                 op->bineChunkCount, op->bineSlotElems);
+          BineAGPermutationAlgorithm algo(g, myIdx);
+  
+          int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
+          struct ncclPatStep ps = {0};
+          do {
+            algo.getNextOp(&ps);
+            if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
+            if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
+            if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
+          } while (ps.last != 2);
+  
+          // One step per dimension -> one recv and one send op per connection.
+          // The final permutation is local: no proxy ops for it.
+          for (int d = 0; d < doublingSteps; ++d) {
+            if (!nRecv[d] && !nSend[d]) continue;
+            const int partner = bineSendPartner(channel->binePartner, rank, d, doublingSteps);
+            if (partner < 0 || partner == rank) {
+              WARN("BINE PERMUTATION: invalid partner %d for dim %d", partner, d);
+              return ncclInternalError;
+            }
+            if (nRecv[d]) {
+              op->nsteps = nRecv[d];
+              NCCLCHECK(SaveProxy(comm, channel, proxyRecv, partner, op, 0, justInquire));
+            }
+            if (nSend[d]) {
+              op->nsteps = nSend[d];
+              NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
+            }
           }
-          if (nSend[d]) {
-            op->nsteps = nSend[d];
-            NCCLCHECK(SaveProxy(comm, channel, proxySend, partner, op, 0, justInquire));
-          }
-        }
-        break;   // common tail restores op->nsteps = savedNsteps INFO: std PERMUTATION should go on bbb path
+          break;   // common tail restores op->nsteps = savedNsteps INFO: std PERMUTATION should go on bbb path
+	}
     }
     case BLOCK_BY_BLOCK: {
-      // XXX: Temporary hack to work with PAT impl.
-      if (op->coll == ncclFuncAllGather) {
+      if (op->coll == ncclFuncAllGather && bineVar == PAT) {
         if (channel->binePartner == nullptr || channel->bineIndex == nullptr ||
             channel->bineOrder == nullptr) {
           WARN("BINE index/order/partner tables are missing for BLOCK_BY_BLOCK");
@@ -1038,8 +1040,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
       const bool isRS = (op->coll == ncclFuncReduceScatter);
       const bool isAG = (op->coll == ncclFuncAllGather);
 
-      // XXX: Temporary hack to work with PAT impl.
-      if (isAG) {
+      if (isAG && bineVar == PAT) {
         BineAgGeom g;
         g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
                op->bineChunkCount, op->bineSlotElems);
@@ -1093,8 +1094,7 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
 
     case SEND: {
 
-      // XXX: Temporary hack to work with PAT impl.
-      if(op->coll == ncclFuncAllGather) {
+      if(op->coll == ncclFuncAllGather && bineVar == PAT) {
         BineAgGeom g;
         g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
               op->bineChunkCount, op->bineSlotElems);

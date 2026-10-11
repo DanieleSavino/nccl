@@ -1145,29 +1145,34 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_S
   {
     ncclBine *bine = &ncclShmem.channel.bine;
     const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+    const ncclBineVariant_t bineVar = bine->variant;
 
-    // XXX: Temporary hack to fix Bine's chunkSteps=1 for reduceScatter.
     using Proto = ProtoSimple<1, 1>;
 
-    switch (bufferManagement) {
-      case BLOCK_BY_BLOCK:
-        runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
-        break;
-      case PERMUTATION:
-        runBinePermutation<T, RedOp, Proto>(tid, nthreads, work);
-        break;
-      case DOUBLE_SEND:
-        runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
-        break;
-      case SEND:
-        runBineSend<T, RedOp, Proto>(tid, nthreads, work);
-        break;
-      case TREE:
-        runBineTree<T, RedOp, Proto>(tid, nthreads, work);
-        break;
-      default:
-        assert(false && "Invalid Bine buffer management");
-        break;
+    if (bineVar == TREE) {
+      runBineTree<T, RedOp, Proto>(tid, nthreads, work);
+    }
+    else if (bineVar == BUTTERFLY) {
+      switch (bufferManagement) {
+        case BLOCK_BY_BLOCK:
+          runBineBlockByBlock<T, RedOp, Proto>(tid, nthreads, work);
+          break;
+        case PERMUTATION:
+          runBinePermutation<T, RedOp, Proto>(tid, nthreads, work);
+          break;
+        case DOUBLE_SEND:
+          runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
+          break;
+        case SEND:
+          runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+          break;
+        default:
+          assert(false && "Invalid Bine buffer management");
+          break;
+      }
+    }
+    else {
+      assert(false && "Invalid Bine variant");
     }
   }
 };
@@ -1179,23 +1184,29 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_L
   {
     ncclBine *bine = &ncclShmem.channel.bine;
     const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+    const ncclBineVariant_t bineVar = bine->variant;
 
-    switch (bufferManagement) {
-      case BLOCK_BY_BLOCK:
-        runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
-        break;
-      case PERMUTATION:
-        runBinePermutation<T, RedOp, ProtoLL>(tid, nthreads, work);
-        break;
-      case DOUBLE_SEND:
-        runBineDoubleSend<T, RedOp, ProtoLL>(tid, nthreads, work);
-        break;
-      case SEND:
-        runBineSend<T, RedOp, ProtoLL>(tid, nthreads, work);
-        break;
-      default:
-        assert(false && "Invalid Bine buffer management");
-        break;
+    if (bineVar == BUTTERFLY) {
+      switch (bufferManagement) {
+        case BLOCK_BY_BLOCK:
+          runBineBlockByBlock<T, RedOp, ProtoLL>(tid, nthreads, work);
+          break;
+        case PERMUTATION:
+          runBinePermutation<T, RedOp, ProtoLL>(tid, nthreads, work);
+          break;
+        case DOUBLE_SEND:
+          runBineDoubleSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+          break;
+        case SEND:
+          runBineSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+          break;
+        default:
+          assert(false && "Invalid Bine buffer management");
+          break;
+      }
+    }
+    else {
+      assert(false && "Invalid Bine variant");
     }
   }
 };
@@ -1207,23 +1218,29 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_L
   {
     ncclBine *bine = &ncclShmem.channel.bine;
     const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+    const ncclBineVariant_t bineVar = bine->variant;
 
-    switch (bufferManagement) {
-      case BLOCK_BY_BLOCK:
-        runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
-        break;
-      case PERMUTATION:
-        runBinePermutation<T, RedOp, ProtoLL128>(tid, nthreads, work);
-        break;
-      case DOUBLE_SEND:
-        runBineDoubleSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
-        break;
-      case SEND:
-        runBineSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
-        break;
-      default:
-        assert(false && "Invalid Bine buffer management");
-        break;
+    if (bineVar == BUTTERFLY) {
+      switch (bufferManagement) {
+        case BLOCK_BY_BLOCK:
+          runBineBlockByBlock<T, RedOp, ProtoLL128>(tid, nthreads, work);
+          break;
+        case PERMUTATION:
+          runBinePermutation<T, RedOp, ProtoLL128>(tid, nthreads, work);
+          break;
+        case DOUBLE_SEND:
+          runBineDoubleSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+          break;
+        case SEND:
+          runBineSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+          break;
+        default:
+          assert(false && "Invalid Bine buffer management");
+          break;
+      }
+    }
+    else {
+      assert(false && "Invalid Bine variant");
     }
   }
 };
