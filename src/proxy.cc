@@ -6,6 +6,7 @@
  *************************************************************************/
 
 #include "bine.h"
+#include "bine_ag.h"
 #include "collectives.h"
 #include "comm.h"
 #include "include/bine_helper.h"
@@ -971,6 +972,43 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
     }
 
     case SEND: {
+
+      // XXX: Temporary hack to work with PAT impl.
+      if(op->coll == ncclFuncAllGather) {
+        BineAgGeom g;
+        g.init(doublingSteps, op->bineCount, op->bineChannelOffset, op->bineChannelCount,
+              op->bineChunkCount, op->bineSlotElems);
+        const int myIdx = bineSendIndex(channel->bineIndex, rank, doublingSteps);
+        BineAgPre pre = bineAgPre(channel->binePartner, channel->bineIndex, channel->bineOrder,
+                                  rank, doublingSteps);
+        BineAGAlgorithm algo(g, rank, myIdx, pre);
+
+        int nSend[BINE_MAX_STEPS + 1] = {0}, nRecv[BINE_MAX_STEPS + 1] = {0};
+        struct ncclPatStep ps = {0};
+        do {
+          algo.getNextOp(&ps);
+          if (ps.flags & PatSkipped) continue;        // continue still evaluates ps.last
+          if (ps.recvDim >= 0 && ps.postRecv) nRecv[ps.recvDim]++;
+          if (ps.sendDim >= 0 && ps.postSend) nSend[ps.sendDim]++;
+        } while (ps.last != 2);
+
+        for (int d = 0; d <= doublingSteps; ++d) {
+          const int partner = d < doublingSteps
+              ? bineSendPartner(channel->binePartner, rank, d, doublingSteps) : -1;
+          if (nRecv[d]) {
+            op->nsteps = nRecv[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxyRecv, d < doublingSteps ? partner : pre.recvPeer,
+                                op, 0, justInquire));
+          }
+          if (nSend[d]) {
+            op->nsteps = nSend[d];
+            NCCLCHECK(SaveProxy(comm, channel, proxySend, d < doublingSteps ? partner : pre.sendPeer,
+                                op, 0, justInquire));
+          }
+        }
+        break;   // the common tail restores op->nsteps = savedNsteps
+      }
+
       if (channel->bineIndex == nullptr || channel->bineOrder == nullptr) {
         WARN("BINE index/order tables are missing for SEND");
         return ncclInternalError;

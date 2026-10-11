@@ -399,7 +399,9 @@ public:
 #define NCCL_PAT_NWORKERS 512
 
 static constexpr int PatUsed = 0x1,
-                     PatSkipped = 0x2;
+                     PatSkipped = 0x2,
+                     PatSrcOutput = 0x4,
+                     PatNoLocalCopy = 0x8;
 
 struct ncclPatStep {
   int recvDim, sendDim, recvOffset, sendOffset, stepOffset, postRecv, postSend, nelem, last, flags;

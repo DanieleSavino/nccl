@@ -7,11 +7,15 @@
 
 #include "network/unpack/unpack.h"
 #include <cassert>
+#include "bine_helper.h"
+#include "bine.h"
+#include "bine_ag.h"
 
 enum primsMode {
   primsModeDefault = 0,
   primsModePatRs = 1,
-  primsModePatAg = 2
+  primsModePatAg = 2,
+  primsModeBineAg = 3
 };
 
 template<typename T, typename RedOp, typename Fan, int Direct,
@@ -661,38 +665,52 @@ private:
           ncclShmem.groups[this->group].devicePlugin.unpack.unpackNetDeviceIndexMask = mask;
         }
       }
-    } else if (mode == primsModePatRs || mode == primsModePatAg) { // Connect to all ranks +/- 2^n
+    } else if (mode == primsModePatRs || mode == primsModePatAg || mode == primsModeBineAg) {
       flags |= PatMode;
       const int roles[5] = { RoleWaitRecv, RolePostRecv, RoleWaitSend, RolePostSend, RoleInput | RoleOutput };
       if (tid < 5) flags |= roles[tid];
 
       int nranks = ncclShmem.comm.nRanks;
-      if (tid < 32 && ((1UL<<tid) < nranks)) {
-        int rank = ncclShmem.comm.rank;
+      int rank = ncclShmem.comm.rank;
+      int recvPeer = -1, sendPeer = -1;
+      if (mode == primsModeBineAg) {
+        // dim s (< S): butterfly partner at kernel step s.  dim S: pre-step redistribution.
+        ncclBine* bine = &ncclShmem.channel.bine;
+        const int S = bine->nDoublingSteps;
+        if (tid < S) {
+          recvPeer = sendPeer = bineSendPartner(bine->partners, rank, tid, S);
+        } else if (tid == S) {
+          BineAgPre pre = bineAgPre(bine->partners, bine->index, bine->order, rank, S);
+          if (pre.recvDim == S) recvPeer = pre.recvPeer;   // only if not aliased to a partner dim
+          if (pre.sendDim == S) sendPeer = pre.sendPeer;
+        }
+      } else if (tid < 32 && ((1UL << tid) < nranks)) {
         uint32_t delta = 1 << tid;
-        // Load recv peer
-        int recvPeer = mode == primsModePatRs ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
-        struct ncclPatPeer* peer = ((struct ncclPatPeer*)recvPeers)+tid;
-        struct ncclConnInfo* conn = peer->conn = ncclShmem.channel.peers[recvPeer]->recv+connIndexRecv;
+        recvPeer = mode == primsModePatRs ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
+        sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
+      }
+      if (recvPeer >= 0) {
+        struct ncclPatPeer* peer = ((struct ncclPatPeer*)recvPeers) + tid;
+        struct ncclConnInfo* conn = peer->conn = ncclShmem.channel.peers[recvPeer]->recv + connIndexRecv;
         peer->step = conn->step;
         peer->buff = conn->buffs[NCCL_PROTO_SIMPLE];
         peer->stepCache = loadStepValue(peer->tailPtr = conn->tail);
         peer->headPtr = conn->head;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
-        // Load send peer
-        int sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
-        peer = ((struct ncclPatPeer*)sendPeers)+tid;
-        conn = peer->conn = ncclShmem.channel.peers[sendPeer]->send+connIndexSend;
+        peer->connStepSize = conn->stepSize / sizeof(T);
+      }
+      if (sendPeer >= 0) {
+        struct ncclPatPeer* peer = ((struct ncclPatPeer*)sendPeers) + tid;
+        struct ncclConnInfo* conn = peer->conn = ncclShmem.channel.peers[sendPeer]->send + connIndexSend;
         peer->step = conn->step;
         peer->connFifo = conn->connFifo;
         peer->buff = conn->buffs[NCCL_PROTO_SIMPLE];
         peer->stepCache = loadStepValue(peer->headPtr = conn->head);
         peer->tailPtr = conn->tail;
         peer->accSize = 0;
-        peer->connStepSize = conn->stepSize/sizeof(T);
+        peer->connStepSize = conn->stepSize / sizeof(T);
       }
-      if (tid==0) {
+      if (tid == 0) {
         ncclShmem.groups[group].userInput = (void*)inputBuf;
         ncclShmem.groups[group].userOutput = (void*)outputBuf;
         ncclShmem.groups[group].redOpArgs = redOpArg;  // scaler for local input
@@ -1078,13 +1096,14 @@ private:
     }
     long long int localAccSize = shmem->localAccSize;
     if (ps->recvDim < 0 && (flags & RoleInput)) { // Source is our own local buffer
-      ncclShmem.groups[group].srcs[0] = userInput + ps->inpIx;
-      if (localAccSize < ps->inpIx + nelem) {
-        // New data, copy to our output buffer.
+      ncclShmem.groups[group].srcs[0] =
+          ((ps->flags & PatSrcOutput) ? userOutput : userInput) + ps->inpIx;
+      if (ps->flags & (PatSrcOutput | PatNoLocalCopy)) {
+        ncclShmem.groups[group].dsts[1] = ncclShmem.groups[group].srcs[0]; // nothing to copy locally
+      } else if (localAccSize < ps->inpIx + nelem) {
         ncclShmem.groups[group].dsts[1] = userOutput + ps->outIx;
         localAccSize = ps->inpIx + nelem;
       } else {
-        // Already done
         ncclShmem.groups[group].dsts[1] = ncclShmem.groups[group].srcs[0];
       }
     }

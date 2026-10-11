@@ -8,6 +8,7 @@
 #include "collectives.h"
 #include "device.h"
 #include "bine.h"
+#include "bine_ag.h"
 #include "primitives.h"
 #include <cstdio>
 
@@ -91,6 +92,69 @@ __device__ __forceinline__ void runRing(int tid, int nthreads,
   // __syncthread().
   if (isNetOffload)
     barrier_sync(14, nthreads);
+}
+
+template <typename T, typename RedOp>
+__device__ __forceinline__ void runBineSendPat(int tid, int nthreads, ncclDevWorkColl* work) {
+#if __CUDA_ARCH__ >= 600
+  using Proto = ProtoSimple<1, 1>;
+  ncclBine* bine = &ncclShmem.channel.bine;
+  const int S = bine->nDoublingSteps, rank = ncclShmem.comm.rank;
+  size_t count, channelOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
+                  &channelOffset, &channelCount, &chunkCount);
+  const size_t slotElems = ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS / sizeof(T);
+
+  static constexpr int nworkers = NCCL_PAT_NWORKERS;
+  struct ncclPatShmem* shmem = (struct ncclPatShmem*)ncclScratchForWarp(0);
+  uint64_t pollCount = 0;
+  __syncthreads();
+  for (int i = tid; i < NCCL_SHMEM_PAT_STEPS; i += nthreads) shmem->patSteps[i].flags = 0;
+  if (tid == 0) shmem->localAccSize = 0;
+  if (tid == nworkers) shmem->parallelFactor = 0;
+  __syncthreads();
+
+  if (tid == nworkers) {                       // schedule thread
+    BineAgGeom g; g.init(S, count, channelOffset, channelCount, chunkCount, slotElems);
+    const int myIdx = bineSendIndex(bine->index, rank, S);
+    BineAgPre pre = bineAgPre(bine->partners, bine->index, bine->order, rank, S);
+    BineAGAlgorithm algo(g, rank, myIdx, pre);
+    shmem->parallelFactor = algo.getParallelFactor();
+    int step = 0;
+    while (1) {
+      struct ncclPatStep* ps = shmem->patSteps + (step % NCCL_SHMEM_PAT_STEPS);
+      cuda::atomic_ref<int, cuda::thread_scope_block> poll(ps->flags);
+      while (poll.load(cuda::memory_order_acquire) != 0) pollCount++;
+      algo.getNextOp(ps);
+      int last = ps->last;
+      step++;
+      if (last == 2) break;
+    }
+  } else if (tid < nworkers) {                 // workers
+    int parallelFactor = 0;
+    volatile int* pfPtr = &shmem->parallelFactor;
+    while (parallelFactor == 0) parallelFactor = *pfPtr;
+    int groupSize = nworkers / (WARP_SIZE * parallelFactor) * WARP_SIZE;
+    int group = tid / groupSize, nGroups = nworkers / groupSize, tidInGroup = tid - group * groupSize;
+
+    Primitives<T, RedOp, FanSymmetric<1>, 0, Proto, 0> prims(
+        tidInGroup, groupSize, (int*)shmem->recvDims, (int*)shmem->sendDims,
+        work->sendbuff, work->recvbuff, work->redOpArg, group, 0, 0, nullptr, nullptr, 0,
+        primsModeBineAg);
+
+    int step = group;
+    while (1) {
+      struct ncclPatStep* ps = shmem->patSteps + (step % NCCL_SHMEM_PAT_STEPS);
+      cuda::atomic_ref<int, cuda::thread_scope_block> poll(ps->flags);
+      while (poll.load(cuda::memory_order_acquire) == 0) pollCount++;
+      int last = ps->last;
+      prims.patCopy(ps, shmem);
+      if (tidInGroup == 0) poll.store(0, cuda::memory_order_release);
+      if (last) break;
+      step += nGroups;
+    }
+  }
+#endif
 }
 
 template <typename T, typename RedOp, typename Proto>
@@ -1201,8 +1265,9 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE,
     case DOUBLE_SEND:
       runBineDoubleSend<T, RedOp, Proto>(tid, nthreads, work);
       break;
+    // XXX: Temporary hack to work with PAT impl.
     case SEND:
-      runBineSend<T, RedOp, Proto>(tid, nthreads, work);
+      runBineSendPat<T, RedOp>(tid, nthreads, work);
       break;
     case TREE:
       runBineTree<T, RedOp, Proto>(tid, nthreads, work);

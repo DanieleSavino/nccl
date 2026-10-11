@@ -775,6 +775,18 @@ static ncclResult_t scheduleCollTasksToPlan(
           }
           proxyOp->ringAlgo->incRefCount();
         }
+
+        if (task->algorithm == NCCL_ALGO_BINE) {
+          size_t cnt, off, chCnt, chunk;
+          ncclCollCbdPart(devWork, c, task->protocol, (int)elementSize,
+                          &cnt, &off, &chCnt, &chunk);
+          proxyOp->bineCount         = cnt;
+          proxyOp->bineChannelOffset = off;
+          proxyOp->bineChannelCount  = chCnt;
+          proxyOp->bineChunkCount    = chunk;
+          proxyOp->bineSlotElems     = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS / elementSize;
+        }
+
         proxyOp->eActivationMask = task->eActivationMask;
         proxyOp->incWorkCounter = true;
         proxyOp->nChannels = nChannels;

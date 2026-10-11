@@ -101,6 +101,12 @@ struct ncclProxyOp {
   int nChannels;
   int nPeers;
 
+  size_t bineCount;
+  size_t bineChannelOffset;
+  size_t bineChannelCount;
+  size_t bineChunkCount;
+  size_t bineSlotElems;
+
   // Profiler plugin
   union {
     struct ncclTaskColl* coll;
