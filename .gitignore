@@ -12,6 +12,8 @@ junits/
 tags
 *.swp
 
+logs/
+
 # Example build artifacts
 *.o
 examples/**/multiple_devices_single_process

@@ -1,1 +1,0 @@
-/mnt/tier2/users/u104045/dev/unitccl/nccl/logs/build/5279772/5279772_submission.sh
