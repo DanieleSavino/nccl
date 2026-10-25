@@ -345,7 +345,7 @@ ncclResult_t buildBineTables(struct ncclComm *comm)
         WARN("NCCL_BINE_VARIANT not set, defaulting to TREE");
       }
       else {
-        ncclBineVariantFromString(str_variant, &comm->channels[c].bine.variant);
+        ncclBineVariantFromString(str_variant, &bineVariant);
       }
 
       comm->channels[c].bine.bufferManagement = bineBufMgmt;

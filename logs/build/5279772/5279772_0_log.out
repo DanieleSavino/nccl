@@ -1,0 +1,5 @@
+submitit INFO (2026-10-01 15:24:57,223) - Starting with JobEnvironment(job_id=5279772, hostname=mel2037, local_rank=0(1), node=0(1), global_rank=0(1))
+submitit INFO (2026-10-01 15:24:57,224) - Loading pickle: /mnt/tier2/users/u104045/dev/unitccl/nccl/logs/build/5279772/5279772_submitted.pkl
+[36m[info] ── build: nccl ──[0m
+[36m[info] $ make -j src.build NVCC_GENCODE="-gencode arch=compute_80,code=sm_80"  (cwd=/mnt/tier2/users/u104045/dev/unitccl/nccl/nccl)[0m
+submitit ERROR (2026-10-01 15:24:57,357) - Submitted job triggered an exception
