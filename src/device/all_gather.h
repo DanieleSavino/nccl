@@ -244,198 +244,397 @@ __device__ __forceinline__ void runBinePermutationPat(int tid, int nthreads, ncc
     });
 }
 
+// Bine allgather "Send" and "Permutation" variants, reworked like the new
+// runBineBlockByBlock:
+//   * sends and recvs run in separate thread groups (separate Primitives)
+//   * the local copy of my block is fused into the step-0 send (directCopySend)
+//   * nothing is ever sent in pieces larger than chunkCount
+//   * (Send variant only) optional stride-free partition across channels
+//
+// NOT COMPILED OR RUN: written against the NCCL device headers from memory.
+// Lines marked VERIFY depend on field/ctor names in your tree.
+
+// Below this many bytes per rank per *channel* we stop slicing every block
+// across channels and instead give each channel a contiguous range of
+// positions (Send variant only). Tune it.
+#ifndef BINE_POS_SLICE_BYTES
+#define BINE_POS_SLICE_BYTES (16 * 1024)
+#endif
+
+// ---------------------------------------------------------------------------
+// Work partition
+// ---------------------------------------------------------------------------
+//  slice mode: this channel moves elements [gridOffset, gridOffset+channelCount)
+//              of EVERY block (ncclCollCbdPart default).
+//              Range of positions = strided in memory unless channelCount==count.
+//  pos mode:   this channel moves WHOLE blocks, but only positions
+//              [ownLo, ownHi). A range of positions is then always one
+//              contiguous run, so there is no stride loop at all.
+//
+// Why pos mode is channel-closed (needed because there is no cross-channel
+// barrier): position p is written and later re-sent only by owner(p), and the
+// partner computes the same intersection with the same ownership, because
+// my sendBeg == partner's recvBeg.
+struct BinePart {
+  ssize_t count, gridOffset, channelCount, chunkCount;
+  int ownLo, ownHi;
+  bool idle;
+};
+
+template <typename T, typename Proto>
+__device__ __forceinline__ BinePart binePartition(ncclDevWorkColl *work,
+                                                  int nRanks,
+                                                  bool allowPosPartition) {
+  BinePart P;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &P.count,
+                  &P.gridOffset, &P.channelCount, &P.chunkCount);
+  P.ownLo = 0;
+  P.ownHi = nRanks;
+  P.idle = (P.channelCount == 0) || (P.count == 0);
+
+  // VERIFY: channelLo / channelHi are what ncclCollCbdPart uses internally.
+  const int nCh = (int)work->channelHi - (int)work->channelLo + 1;
+  const int chIdx = (int)ncclShmem.channelId - (int)work->channelLo;
+
+  // Must depend only on values that are identical on every rank and channel.
+  const bool posPart =
+      allowPosPartition && nCh > 1 && nRanks >= nCh &&
+      (size_t)P.count * sizeof(T) < (size_t)nCh * BINE_POS_SLICE_BYTES;
+
+  if (posPart) {
+    const int per = (nRanks + nCh - 1) / nCh;
+    P.ownLo = min(chIdx * per, nRanks);
+    P.ownHi = min(P.ownLo + per, nRanks);
+    P.gridOffset = 0;
+    P.channelCount = P.count;  // whole blocks
+    P.idle = (P.ownLo >= P.ownHi) || (P.count == 0);
+  }
+  return P;
+}
+
+// Calls fn(offset, n) for every transfer that moves positions [lo, hi).
+// n <= chunkCount always. Same sequence on sender and receiver.
+template <typename Fn>
+__device__ __forceinline__ void bineForRange(int lo, int hi, const BinePart &P,
+                                             Fn fn) {
+  if (hi <= lo) return;
+  if (P.channelCount == P.count) {
+    // Whole blocks: [lo,hi) is a single contiguous run (gridOffset == 0).
+    const ssize_t base = (ssize_t)lo * P.count;
+    const ssize_t total = (ssize_t)(hi - lo) * P.count;
+    for (ssize_t o = 0; o < total; o += P.chunkCount)
+      fn(base + o, (int)min(P.chunkCount, total - o));
+  } else {
+    // Slice of every block: strided, one op per (chunk, block).
+    for (ssize_t e = 0; e < P.channelCount; e += P.chunkCount) {
+      const int n = (int)min(P.chunkCount, P.channelCount - e);
+      for (int j = lo; j < hi; ++j)
+        fn((ssize_t)j * P.count + P.gridOffset + e, n);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Send/recv thread split (same layout as your runBineBlockByBlock)
+// ---------------------------------------------------------------------------
+// Primitives are only constructed on a side that has traffic. Both ends of a
+// connection always agree on that (see BinePart above), otherwise the Direct
+// pointer exchange in the ctor would hang.
+template <typename T, typename RedOp, typename Proto, typename SendFn,
+          typename RecvFn>
+__device__ __forceinline__ void bineSendRecvSplit(
+    int tid, int nthreads, ncclDevWorkColl *work, const T *sendBuf, T *recvBuf,
+    int sendPeer, int recvPeer, bool doSend, bool doRecv, SendFn sendFn,
+    RecvFn recvFn) {
+  const int nSend = (nthreads / 2 / WARP_SIZE) * WARP_SIZE;
+  if (tid < nSend) {
+    if (doSend) {
+      int peer[1] = {sendPeer};
+      Primitives<T, RedOp, FanAsymmetric<0, 1>, /*Direct=*/1, Proto, 0> prims(
+          tid, nSend, peer, peer, sendBuf, recvBuf, work->redOpArg,
+          0 * Proto::MaxGroupWidth, 0, 0, work);
+      sendFn(prims);
+    }
+  } else if (doRecv) {
+    int peer[1] = {recvPeer};
+    Primitives<T, RedOp, FanAsymmetric<1, 0>, /*Direct=*/1, Proto, 0> prims(
+        tid - nSend, nthreads - nSend, peer, peer, sendBuf, recvBuf,
+        work->redOpArg, 1 * Proto::MaxGroupWidth, 0, 0, work);
+    recvFn(prims);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Send variant
+// ---------------------------------------------------------------------------
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runBineSend(int tid, int nthreads,
                                             ncclDevWorkColl *work) {
   ncclBine *bine = &ncclShmem.channel.bine;
   const int steps = bine->nDoublingSteps;  // nRanks == 1 << steps
-
-  ssize_t count, gridOffset, channelCount, chunkCount;
-  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
-                  &gridOffset, &channelCount, &chunkCount);
-
-  T *recvBuf = (T *)work->recvbuff;
-  T *sendBuf = (T *)work->sendbuff;
+  const int nRanks = ncclShmem.comm.nRanks;
   const int rank = ncclShmem.comm.rank;
 
-  // SEND views over the generic tables.
-  const int myIdx      = bineSendIndex(bine->index, rank, steps);  // position I own
-  const int redistTo   = bineSendOrder(bine->order, rank, steps);  // rank that owns position `rank`
-  const int redistFrom = myIdx;                                    // I need block myIdx (from rank myIdx)
+  const BinePart P = binePartition<T, Proto>(work, nRanks, /*allowPos=*/true);
+  if (P.idle) return;
+  const ssize_t count = P.count;
 
-  const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
-                         (NCCL_P2P_READ | NCCL_P2P_WRITE);
+  const T *sendBuf = (const T *)work->sendbuff;
+  T *recvBuf = (T *)work->recvbuff;
 
-  // ---- 1. Pre-step: put block `myIdx` at position `myIdx` ----
-  T *mySeg = recvBuf + (ssize_t)rank * count;
-  if (redistTo == rank) {
-    if (sendBuf != mySeg) {
-      for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
-        mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
+  const int myIdx = bineSendIndex(bine->index, rank, steps);
+  const int redistTo = bineSendOrder(bine->order, rank, steps);
+  const int redistFrom = myIdx;
+  const bool selfPlaced = (redistTo == rank);
+
+  auto owns = [&](int pos) { return pos >= P.ownLo && pos < P.ownHi; };
+
+  // The local copy is only fused when sendBuf does NOT alias recvBuf. Otherwise
+  // the partner's step-0 direct write could land on my source before I read it.
+  const bool inPlace = (sendBuf == recvBuf + (ssize_t)rank * count);
+  const bool fuseCopy =
+      selfPlaced && !inPlace && steps > 0 &&
+      bineSendPartner(bine->partners, rank, 0, steps) >= 0;
+
+  // ---- 1. Pre-step: block `rank` must land at position `rank` on redistTo ----
+  if (!selfPlaced) {
+    bineSendRecvSplit<T, RedOp, Proto>(
+        tid, nthreads, work, sendBuf, recvBuf, redistTo, redistFrom,
+        /*doSend=*/owns(rank), /*doRecv=*/owns(myIdx),
+        [&](auto &prims) {
+          for (ssize_t e = 0; e < P.channelCount; e += P.chunkCount) {
+            const int n = (int)min(P.chunkCount, P.channelCount - e);
+            prims.directSend(P.gridOffset + e,
+                             (ssize_t)rank * count + P.gridOffset + e, n);
+          }
+        },
+        [&](auto &prims) {
+          for (ssize_t e = 0; e < P.channelCount; e += P.chunkCount) {
+            const int n = (int)min(P.chunkCount, P.channelCount - e);
+            prims.directRecv((ssize_t)myIdx * count + P.gridOffset + e, n);
+          }
+        });
+    __syncthreads();  // positions must be in place before step 0 reads them
+  } else if (!inPlace && !fuseCopy) {  // idle at step 0: plain local copy
+    if (owns(rank)) {
+      T *mySeg = recvBuf + (ssize_t)rank * count;
+      for (ssize_t e = tid; e < P.channelCount; e += nthreads)
+        mySeg[P.gridOffset + e] = sendBuf[P.gridOffset + e];
     }
-  } else {
-    int sendPeer[1] = {redistTo};
-    int recvPeer[1] = {redistFrom};
-
-    // My block must land at offset `rank` in redistTo's buffer, because
-    // index_send[redistTo] == rank. It is NOT redistTo * count.
-    const ssize_t dstOffForPeer = (ssize_t)rank * count + gridOffset;
-    const ssize_t myOff         = (ssize_t)myIdx * count + gridOffset;
-
-    // One Primitives for the whole pre-step. Send and recv go chunk by chunk,
-    // so we never have more than one chunk in flight before receiving.
-    auto pre = [&](auto &prim, bool direct) {
-      for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-        const int ne = (int)min(chunkCount, channelCount - elem);
-        if (direct) {
-          prim.directSend(gridOffset + elem, dstOffForPeer + elem, ne);
-          prim.directRecv(myOff + elem, ne);
-        } else {
-          prim.send(gridOffset + elem, ne);
-          prim.recv(myOff + elem, ne);
-        }
-      }
-    };
-
-    if (useDirect) {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-          tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-      pre(prim, true);
-    } else {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-          tid, nthreads, recvPeer, sendPeer, sendBuf, recvBuf, work->redOpArg);
-      pre(prim, false);
-    }
+    __syncthreads();
   }
-  __syncthreads();  // positions must be in place before step 0 reads them
 
-  // ---- 2. Distance-doubling butterfly: 1 Primitives per step ----
+  // ---- 2. Distance-doubling butterfly, positions == final block ids ----
   for (int s = 0; s < steps; ++s) {
     const int partner = bineSendPartner(bine->partners, rank, s, steps);
-    if (partner < 0) continue;
+    if (partner >= 0) {
+      const int span = 1 << s;
+      const int base = (myIdx >> (s + 1)) << (s + 1);
+      const bool keepLower = ((myIdx >> s) & 1) == 0;
+      const int sendBeg = keepLower ? base : base + span;
+      const int recvBeg = keepLower ? base + span : base;
 
-    const int span       = 1 << s;
-    const int blockSize  = span << 1;
-    const int base       = (myIdx / blockSize) * blockSize;
-    const bool keepLower = ((myIdx >> s) & 1) == 0;
+      // Clip to the positions this channel owns (no-op in slice mode).
+      const int sLo = max(sendBeg, P.ownLo), sHi = min(sendBeg + span, P.ownHi);
+      const int rLo = max(recvBeg, P.ownLo), rHi = min(recvBeg + span, P.ownHi);
+      const bool copyHere = (s == 0 && fuseCopy);  // sendBeg == myIdx == rank
 
-    // I hold the half I keep and send it; I receive the other half.
-    const int sendBeg = keepLower ? base : base + span;
-    const int recvBeg = keepLower ? base + span : base;
-
-    int peers[1] = {partner};
-
-    auto run = [&](auto &prim, bool direct) {
-      if (channelCount == count) {
-        // This channel covers whole blocks, so the span is one contiguous range.
-        const ssize_t sBase = (ssize_t)sendBeg * count + gridOffset;
-        const ssize_t rBase = (ssize_t)recvBeg * count + gridOffset;
-        const ssize_t total = (ssize_t)span * count;
-        // Pieces must fit in the FIFO without the peer receiving, or both sides
-        // block in send. Keep them aligned to chunkCount. Start at 2*chunkCount, then tune.
-        const ssize_t piece = chunkCount * 2;
-        for (ssize_t o = 0; o < total; o += piece) {
-          const ssize_t n = min(piece, total - o);
-          if (direct) { prim.directSendFromOutput(sBase + o, n); prim.directRecv(rBase + o, n); }
-          else        { prim.sendFromOutput(sBase + o, n);       prim.recv(rBase + o, n); }
-        }
-      } else {
-        // Channel slices break contiguity: per-block, per-chunk (your current loop).
-        for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-          const ssize_t dataOff = gridOffset + elem;
-          const int ne = (int)min(chunkCount, channelCount - elem);
-          for (int j = 0; j < span; ++j) {
-            const ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
-            const ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
-            if (direct) { prim.directSendFromOutput(sOff, ne); prim.directRecv(rOff, ne); }
-            else        { prim.sendFromOutput(sOff, ne);       prim.recv(rOff, ne); }
-          }
-        }
-      }
-    };
-
-    if (useDirect) {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-      run(prim, true);
-    } else {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-      run(prim, false);
+      bineSendRecvSplit<T, RedOp, Proto>(
+          tid, nthreads, work, sendBuf, recvBuf, partner, partner,
+          sHi > sLo, rHi > rLo,
+          [&](auto &prims) {
+            bineForRange(sLo, sHi, P, [&](ssize_t off, int n) {
+              if (copyHere)
+                prims.directCopySend(off - (ssize_t)rank * count, off, n);
+              else
+                prims.directSendFromOutput(off, n);
+            });
+          },
+          [&](auto &prims) {
+            bineForRange(rLo, rHi, P,
+                         [&](ssize_t off, int n) { prims.directRecv(off, n); });
+          });
     }
-    __syncthreads();  // step s+1 reads data received in step s
+    __syncthreads();  // step s+1 sends what step s received
   }
 }
 
+// ---------------------------------------------------------------------------
+// Permutation variant
+// ---------------------------------------------------------------------------
+// Stays in slice mode: the final in-place permutation moves block b from
+// position index(b) to b, which crosses channel-owned position ranges and
+// would need a cross-channel barrier. Contiguity is therefore only available
+// when channelCount == count.
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBinePermutation(int tid, int nthreads,
+                                                   ncclDevWorkColl *work) {
+  ncclBine *bine = &ncclShmem.channel.bine;
+  const int steps = bine->nDoublingSteps;
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank = ncclShmem.comm.rank;
+
+  const BinePart P = binePartition<T, Proto>(work, nRanks, /*allowPos=*/false);
+  if (P.idle) return;
+  const ssize_t count = P.count;
+
+  const T *sendBuf = (const T *)work->sendbuff;
+  T *recvBuf = (T *)work->recvbuff;
+  const int myIdx = bineSendIndex(bine->index, rank, steps);
+
+  // ---- 1. Place my block at position myIdx ----
+  // Fused into the step-0 send unless sendBuf aliases recvBuf (in-place
+  // allgather); then the copy must finish before the receive side is up,
+  // or the partner could overwrite my source.
+  const bool inPlaceAG = (sendBuf == recvBuf + (ssize_t)rank * count);
+  const bool atFinalSpot = (sendBuf == recvBuf + (ssize_t)myIdx * count);
+  const bool fuseCopy = !inPlaceAG && steps > 0 &&
+                        bineSendPartner(bine->partners, rank, 0, steps) >= 0;
+  if (!atFinalSpot && !fuseCopy) {
+    T *mySeg = recvBuf + (ssize_t)myIdx * count;
+    for (ssize_t e = tid; e < P.channelCount; e += nthreads)
+      mySeg[P.gridOffset + e] = sendBuf[P.gridOffset + e];
+    __syncthreads();
+  }
+
+  // ---- 2. Distance-doubling butterfly in position space ----
+  for (int s = 0; s < steps; ++s) {
+    const int partner = bineSendPartner(bine->partners, rank, s, steps);
+    if (partner >= 0) {
+      const int span = 1 << s;
+      const int base = (myIdx >> (s + 1)) << (s + 1);
+      const bool keepLower = ((myIdx >> s) & 1) == 0;
+      const int sendBeg = keepLower ? base : base + span;
+      const int recvBeg = keepLower ? base + span : base;
+      const bool copyHere = (s == 0 && fuseCopy);  // sendBeg == myIdx
+
+      bineSendRecvSplit<T, RedOp, Proto>(
+          tid, nthreads, work, sendBuf, recvBuf, partner, partner,
+          /*doSend=*/true, /*doRecv=*/true,
+          [&](auto &prims) {
+            bineForRange(sendBeg, sendBeg + span, P,
+                         [&](ssize_t off, int n) {
+                           if (copyHere)
+                             prims.directCopySend(
+                                 off - (ssize_t)myIdx * count, off, n);
+                           else
+                             prims.directSendFromOutput(off, n);
+                         });
+          },
+          [&](auto &prims) {
+            bineForRange(recvBeg, recvBeg + span, P,
+                         [&](ssize_t off, int n) { prims.directRecv(off, n); });
+          });
+    }
+    __syncthreads();  // step s+1 reads data received in step s
+  }
+
+  // ---- 3. Final in-place permutation: block b moves from index(b) to b ----
+  const int *idxTbl = bine->index;
+  bineInPlacePermute<T>(
+      tid, nthreads, recvBuf,
+      [&](int b) { return bineSendIndex(idxTbl, b, steps); }, nRanks, count,
+      P.gridOffset, P.channelCount);
+}
+
+// ---------------------------------------------------------------------------
+// DoubleSend (two-transmissions) variant
+// ---------------------------------------------------------------------------
+// Blocks live at their natural slots (position == block id) and there is no
+// final permutation, so position ownership is channel-closed and pos mode is
+// safe. A window [start, start+span) is circular, so it is at most two
+// contiguous runs: [start, p) then the wrapped tail [0, end-p).
+// Sender and receiver visit the runs in that same order (window order).
+
+template <typename Fn>
+__device__ __forceinline__ void bineForCircRange(int start, int span,
+                                                 int nRanks,
+                                                 const BinePart &P, Fn fn) {
+  const int end = start + span;  // start < nRanks
+  bineForRange(max(start, P.ownLo), min(min(end, nRanks), P.ownHi), P, fn);
+  if (end > nRanks)  // wrapped tail
+    bineForRange(P.ownLo, min(end - nRanks, P.ownHi), P, fn);
+}
+
+__device__ __forceinline__ bool bineCircNonEmpty(int start, int span,
+                                                 int nRanks,
+                                                 const BinePart &P) {
+  const int end = start + span;
+  return (max(start, P.ownLo) < min(min(end, nRanks), P.ownHi)) ||
+         (end > nRanks && P.ownLo < min(end - nRanks, P.ownHi));
+}
 
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runBineDoubleSend(int tid, int nthreads,
-                                                    ncclDevWorkColl *work) {
+                                                  ncclDevWorkColl *work) {
   ncclBine *bine = &ncclShmem.channel.bine;
   const int steps = bine->nDoublingSteps;  // nRanks == 1 << steps
-
-  ssize_t count, gridOffset, channelCount, chunkCount;
-  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
-                  &gridOffset, &channelCount, &chunkCount);
-  if (channelCount == 0) return;
-
-  T *recvBuf = (T *)work->recvbuff;
-  T *sendBuf = (T *)work->sendbuff;
-  const int p    = ncclShmem.comm.nRanks;
+  const int p = ncclShmem.comm.nRanks;
   const int rank = ncclShmem.comm.rank;
-  const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
-                         (NCCL_P2P_READ | NCCL_P2P_WRITE);
 
-  // ---- 1. Own block to its natural slot (local copy) ----
-  T *mySeg = recvBuf + (ssize_t)rank * count;
-  if (sendBuf != mySeg) {
-    for (ssize_t e = tid; e < channelCount; e += nthreads)
-      mySeg[gridOffset + e] = sendBuf[gridOffset + e];
+  const BinePart P = binePartition<T, Proto>(work, p, /*allowPos=*/true);
+  if (P.idle) return;
+  const ssize_t count = P.count;
+
+  const T *sendBuf = (const T *)work->sendbuff;
+  T *recvBuf = (T *)work->recvbuff;
+
+  const bool haveSched = steps > 0 && bine->dhlvPartners;
+  auto active = [&](int s) {
+    const int q = bine->dhlvPartners[rank * steps + s];
+    return q >= 0 && q != rank;
+  };
+  auto owns = [&](int pos) { return pos >= P.ownLo && pos < P.ownHi; };
+
+  // ---- 1. Own block to its natural slot ----
+  // Fused into the first send (g == 0, window == [rank]) when sendBuf is a
+  // separate buffer. In-place needs no copy at all.
+  const bool inPlace = (sendBuf == recvBuf + (ssize_t)rank * count);
+  const bool fuseCopy = haveSched && !inPlace && active(steps - 1);
+  if (!inPlace && !fuseCopy) {
+    if (owns(rank)) {
+      T *mySeg = recvBuf + (ssize_t)rank * count;
+      for (ssize_t e = tid; e < P.channelCount; e += nthreads)
+        mySeg[P.gridOffset + e] = sendBuf[P.gridOffset + e];
+    }
+    __syncthreads();
   }
-  __syncthreads();  // slot `rank` must be filled before the first send reads it
-  if (steps == 0 || !bine->dhlvPartners) return;
+  if (!haveSched) return;
 
   // ---- 2. Reverse of the RS schedule: window start `a`, size 1 << g ----
-  int a = rank;  // RS always ends with window [rank]; AG starts there
-
+  int a = rank;
   for (int s = steps - 1; s >= 0; --s) {
-    const int g    = steps - 1 - s;
+    const int g = steps - 1 - s;
     const int span = 1 << g;
-    const bool sendBottom = ((rank & 1) == (g & 1));  // same rule as the RS kernel
+    const bool sendBottom = ((rank & 1) == (g & 1));  // same rule as RS kernel
 
-    // I hold [a, a+span) and send it. The RS sent the other half of the doubled window.
     const int sendStart = a;
     const int recvStart = sendBottom ? (a - span + p) % p : (a + span) % p;
-    if (sendBottom) a = recvStart;  // window grows downward; otherwise start unchanged
+    if (sendBottom) a = recvStart;
 
-    const int partner = bine->dhlvPartners[rank * steps + s];
-    if (partner >= 0 && partner != rank) {
-      int peers[1] = {partner};
+    if (active(s)) {
+      const int partner = bine->dhlvPartners[rank * steps + s];
+      const bool copyHere = (g == 0 && fuseCopy);  // sendStart == rank
 
-      auto run = [&](auto &prim, bool direct) {
-        for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-          const ssize_t dataOff = gridOffset + elem;
-          const int ne = (int)min(chunkCount, channelCount - elem);
-          for (int j = 0; j < span; ++j) {
-            const ssize_t sOff = (ssize_t)((sendStart + j) % p) * count + dataOff;
-            const ssize_t rOff = (ssize_t)((recvStart + j) % p) * count + dataOff;
-            if (direct) { prim.directSendFromOutput(sOff, ne); prim.directRecv(rOff, ne); }
-            else        { prim.sendFromOutput(sOff, ne);       prim.recv(rOff, ne); }
-          }
-        }
-      };
-
-      if (useDirect) {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-            tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg,
-            0, 0, 0, work);
-        run(prim, true);
-      } else {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-            tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg,
-            0, 0, 0, work);
-        run(prim, false);
-      }
+      // recvStart == partner's sendStart, so both sides see the same wrap
+      // point and the same run order.
+      bineSendRecvSplit<T, RedOp, Proto>(
+          tid, nthreads, work, sendBuf, recvBuf, partner, partner,
+          bineCircNonEmpty(sendStart, span, p, P),
+          bineCircNonEmpty(recvStart, span, p, P),
+          [&](auto &prims) {
+            bineForCircRange(sendStart, span, p, P, [&](ssize_t off, int n) {
+              if (copyHere)
+                prims.directCopySend(off - (ssize_t)rank * count, off, n);
+              else
+                prims.directSendFromOutput(off, n);
+            });
+          },
+          [&](auto &prims) {
+            bineForCircRange(recvStart, span, p, P, [&](ssize_t off, int n) {
+              prims.directRecv(off, n);
+            });
+          });
     }
     __syncthreads();  // next step sends blocks received in this one
   }
@@ -452,20 +651,25 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
                   &gridOffset, &channelCount, &chunkCount);
   if (channelCount == 0) return;
 
+  const T *sendBuf = (const T *)work->sendbuff;
   T *recvBuf = (T *)work->recvbuff;
-  T *sendBuf = (T *)work->sendbuff;
   const int rank = ncclShmem.comm.rank;
+  const int myIdx = bineSendIndex(bine->index, rank, steps);
 
-  T *mySeg = recvBuf + (ssize_t)rank * count;
-  if (sendBuf != mySeg) {
+  // Local copy: fuse it into the step-0 send when possible (as the ring does).
+  const bool inPlace = (sendBuf == recvBuf + (ssize_t)rank * count);
+  const bool fuseCopy = !inPlace && steps > 0 &&
+                        bineSendPartner(bine->partners, rank, 0, steps) >= 0;
+  if (!inPlace && !fuseCopy) {  // fallback for ranks idle at step 0
+    T *mySeg = recvBuf + (ssize_t)rank * count;
     for (ssize_t e = tid; e < channelCount; e += nthreads)
       mySeg[gridOffset + e] = sendBuf[gridOffset + e];
+    __syncthreads();
   }
-  __syncthreads();
 
-  const int myIdx = bineSendIndex(bine->index, rank, steps);
-  const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
-                         (NCCL_P2P_READ | NCCL_P2P_WRITE);
+  // Inside a step, sends and recvs are independent -> separate thread groups.
+  const int nSend = (nthreads / 2 / WARP_SIZE) * WARP_SIZE;
+  const bool isSender = tid < nSend;
 
   for (int s = 0; s < steps; ++s) {
     const int partner = bineSendPartner(bine->partners, rank, s, steps);
@@ -477,121 +681,38 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
       const int recvBeg = keepLower ? base + span : base;
       int peers[1] = {partner};
 
-      auto run = [&](auto &prim, bool direct) {
+      if (isSender) {
+        Primitives<T, RedOp, FanAsymmetric<0, 1>, /*Direct=*/1, Proto, 0> prims(
+            tid, nSend, peers, peers, sendBuf, recvBuf, work->redOpArg,
+            0 * Proto::MaxGroupWidth, 0, 0, work);
         for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
           const ssize_t dataOff = gridOffset + elem;
           const int ne = (int)min(chunkCount, channelCount - elem);
           for (int j = 0; j < span; ++j) {
-            // position -> block id (= rank that owns that position)
-            const int sBlk = bineSendOrder(bine->order, sendBeg + j, steps);
-            const int rBlk = bineSendOrder(bine->order, recvBeg + j, steps);
-            const ssize_t sOff = (ssize_t)sBlk * count + dataOff;
-            const ssize_t rOff = (ssize_t)rBlk * count + dataOff;
-            if (direct) { prim.directSendFromOutput(sOff, ne); prim.directRecv(rOff, ne); }
-            else        { prim.sendFromOutput(sOff, ne);       prim.recv(rOff, ne); }
+            const int blk = bineSendOrder(bine->order, sendBeg + j, steps);
+            const ssize_t off = (ssize_t)blk * count + dataOff;
+            if (s == 0 && fuseCopy) prims.directCopySend(dataOff, off, ne);  // blk == rank
+            else                    prims.directSendFromOutput(off, ne);
           }
         }
-      };
-
-      if (useDirect) {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-            tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-        run(prim, true);
       } else {
-        Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-            tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-        run(prim, false);
-      }
-    }
-    __syncthreads();
-  }
-}
-
-template <typename T, typename RedOp, typename Proto>
-__device__ __forceinline__ void runBinePermutation(int tid, int nthreads,
-                                                     ncclDevWorkColl *work) {
-  ncclBine *bine = &ncclShmem.channel.bine;
-  const int steps = bine->nDoublingSteps;  // nRanks == 1 << steps
-
-  ssize_t count, gridOffset, channelCount, chunkCount;
-  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
-                  &gridOffset, &channelCount, &chunkCount);
-  if (channelCount == 0) return;
-
-  T *recvBuf = (T *)work->recvbuff;
-  T *sendBuf = (T *)work->sendbuff;
-  const int nRanks = ncclShmem.comm.nRanks;
-  const int rank   = ncclShmem.comm.rank;
-  const int myIdx  = bineSendIndex(bine->index, rank, steps);  // position I own
-
-  const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
-                         (NCCL_P2P_READ | NCCL_P2P_WRITE);
-
-  // ---- 1. Place my block at position myIdx (local copy, no communication) ----
-  T *mySeg = recvBuf + (ssize_t)myIdx * count;
-  if (sendBuf != mySeg) {
-    for (ssize_t e = tid; e < channelCount; e += nthreads)
-      mySeg[gridOffset + e] = sendBuf[gridOffset + e];
-  }
-  __syncthreads();  // position myIdx must be filled before step 0 sends it
-
-  // ---- 2. Distance-doubling butterfly in position space ----
-  for (int s = 0; s < steps; ++s) {
-    const int partner = bineSendPartner(bine->partners, rank, s, steps);
-    if (partner < 0) continue;
-
-    const int span       = 1 << s;
-    const int base       = (myIdx >> (s + 1)) << (s + 1);
-    const bool keepLower = ((myIdx >> s) & 1) == 0;
-    // I hold the half I keep and send it; I receive the other half.
-    const int sendBeg = keepLower ? base : base + span;
-    const int recvBeg = keepLower ? base + span : base;
-
-    int peers[1] = {partner};
-
-    auto run = [&](auto &prim, bool direct) {
-      if (channelCount == count) {
-        const ssize_t sBase = (ssize_t)sendBeg * count + gridOffset;
-        const ssize_t rBase = (ssize_t)recvBeg * count + gridOffset;
-        const ssize_t total = (ssize_t)span * count;
-        const ssize_t piece = chunkCount * 2;   // same tuning knob as runBineSend
-        for (ssize_t o = 0; o < total; o += piece) {
-          const ssize_t n = min(piece, total - o);
-          if (direct) { prim.directSendFromOutput(sBase + o, n); prim.directRecv(rBase + o, n); }
-          else        { prim.sendFromOutput(sBase + o, n);       prim.recv(rBase + o, n); }
-        }
-      } else {
+        Primitives<T, RedOp, FanAsymmetric<1, 0>, /*Direct=*/1, Proto, 0> prims(
+            tid - nSend, nthreads - nSend, peers, peers, sendBuf, recvBuf,
+            work->redOpArg, 1 * Proto::MaxGroupWidth, 0, 0, work);
         for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
           const ssize_t dataOff = gridOffset + elem;
           const int ne = (int)min(chunkCount, channelCount - elem);
           for (int j = 0; j < span; ++j) {
-            const ssize_t sOff = (ssize_t)(sendBeg + j) * count + dataOff;
-            const ssize_t rOff = (ssize_t)(recvBeg + j) * count + dataOff;
-            if (direct) { prim.directSendFromOutput(sOff, ne); prim.directRecv(rOff, ne); }
-            else        { prim.sendFromOutput(sOff, ne);       prim.recv(rOff, ne); }
+            const int blk = bineSendOrder(bine->order, recvBeg + j, steps);
+            prims.directRecv((ssize_t)blk * count + dataOff, ne);
           }
         }
       }
-    };
-
-    if (useDirect) {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(
-          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-      run(prim, true);
-    } else {
-      Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(
-          tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
-      run(prim, false);
     }
-    __syncthreads();  // step s+1 reads data received in step s
+    __syncthreads();  // step s+1 sends what step s received
   }
-
-  // ---- 3. Final in-place permutation: block b moves from position index(b) to b ----
-  const int *idxTbl = bine->index;
-  bineInPlacePermute<T>(tid, nthreads, recvBuf,
-      [&](int b) { return bineSendIndex(idxTbl, b, steps); },
-      nRanks, count, gridOffset, channelCount);
 }
+
 
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkColl* work) {

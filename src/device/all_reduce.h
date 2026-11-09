@@ -115,7 +115,7 @@ __device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkCo
  
   // ---------------- root: fused reduce + broadcast ----------------
   if (parent < 0) {
-    Primitives<T, RedOp, FanSymmetric<BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+    Primitives<T, RedOp, FanSymmetric<BINE_AR_MAX_FAN>, /*Direct=*/1, Proto, 0>
         prims(tid, nthreads, children, children, work->sendbuff, work->recvbuff,
               work->redOpArg, 0, 0, 0, work);
     for (ssize_t e = 0; e < channelCount; e += chunkCount) {
@@ -137,7 +137,7 @@ __device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkCo
  
   if (tid < nthreadsSplit) {
     // Reduce up: recv from all children (+ own input), send to parent.
-    Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 1>, /*Direct=*/0, Proto, 0>
+    Primitives<T, RedOp, FanAsymmetric<BINE_AR_MAX_FAN, 1>, /*Direct=*/1, Proto, 0>
         prims(tid, nthreadsSplit, children, &parent, work->sendbuff, work->recvbuff,
               work->redOpArg, 0 * Proto::MaxGroupWidth, 0, 0, work);
     if (nChildren == 0) {
@@ -153,7 +153,7 @@ __device__ __forceinline__ void runBineTree(int tid, int nthreads, ncclDevWorkCo
     }
   } else {
     // Broadcast down: recv from parent, write to output, forward to children.
-    Primitives<T, RedOp, FanAsymmetric<1, BINE_AR_MAX_FAN>, /*Direct=*/0, Proto, 0>
+    Primitives<T, RedOp, FanAsymmetric<1, BINE_AR_MAX_FAN>, /*Direct=*/1, Proto, 0>
         prims(tid - nthreadsSplit, nthreads - nthreadsSplit, &parent, children,
               work->sendbuff, work->recvbuff, work->redOpArg,
               1 * Proto::MaxGroupWidth, 0, 0, work);
@@ -211,7 +211,7 @@ __device__ __forceinline__ void runBineSend(int tid, int nthreads,
   if (steps == 0) return;
 
   const int myIdx = bineSendIndex(bine->index, rank, steps);
-  const bool useDirect = false; //(work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
+  const bool useDirect = true; //(work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) ==
                          //(NCCL_P2P_READ | NCCL_P2P_WRITE);
 
   const ssize_t loopCount = (ssize_t)nRanks * chunkCount;
@@ -1001,6 +1001,44 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPL
       runBineSend<T, RedOp, Proto>(tid, nthreads, work);
     else if (bineVar == TREE)
       runBineTree<T, RedOp, Proto>(tid, nthreads, work);
+    else {
+      // Connect/SaveProxyBine only register the tree phases for non-SEND, so there is no
+      // doubling connectivity here.
+      assert(false && "Bine AllReduce doubling path requires SEND or TREE");
+    }
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineVariant_t bineVar = bine->variant;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    if (bufferManagement == SEND)
+      runBineSend<T, RedOp, ProtoLL>(tid, nthreads, work);
+    else if (bineVar == TREE)
+      runBineTree<T, RedOp, ProtoLL>(tid, nthreads, work);
+    else {
+      // Connect/SaveProxyBine only register the tree phases for non-SEND, so there is no
+      // doubling connectivity here.
+      assert(false && "Bine AllReduce doubling path requires SEND or TREE");
+    }
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const ncclBineVariant_t bineVar = bine->variant;
+    const ncclBineBufferManagement_t bufferManagement = bine->bufferManagement;
+
+    if (bufferManagement == SEND)
+      runBineSend<T, RedOp, ProtoLL128>(tid, nthreads, work);
+    else if (bineVar == TREE)
+      runBineTree<T, RedOp, ProtoLL128>(tid, nthreads, work);
     else {
       // Connect/SaveProxyBine only register the tree phases for non-SEND, so there is no
       // doubling connectivity here.
