@@ -258,7 +258,7 @@ __device__ __forceinline__ void runBinePermutationPat(int tid, int nthreads, ncc
 // across channels and instead give each channel a contiguous range of
 // positions (Send variant only). Tune it.
 #ifndef BINE_POS_SLICE_BYTES
-#define BINE_POS_SLICE_BYTES (16 * 1024)
+#define BINE_POS_SLICE_BYTES (64 * 1024 * 1024)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -640,36 +640,52 @@ __device__ __forceinline__ void runBineDoubleSend(int tid, int nthreads,
   }
 }
 
+// fn(offset, n) for positions [lo, hi), position -> block id via blkOf(pos).
+// Chunk is the outer loop, same order on sender and receiver. n <= chunkCount.
+template <typename Map, typename Fn>
+__device__ __forceinline__ void bineForMapped(int lo, int hi, const BinePart &P,
+                                              Map blkOf, Fn fn) {
+  if (hi <= lo) return;
+  for (ssize_t e = 0; e < P.channelCount; e += P.chunkCount) {
+    const int n = (int)min(P.chunkCount, P.channelCount - e);
+    for (int j = lo; j < hi; ++j)
+      fn((ssize_t)blkOf(j) * P.count + P.gridOffset + e, n);
+  }
+}
+
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
                                                     ncclDevWorkColl *work) {
   ncclBine *bine = &ncclShmem.channel.bine;
-  const int steps = bine->nDoublingSteps;
+  const int steps = bine->nDoublingSteps;  // nRanks == 1 << steps
+  const int nRanks = ncclShmem.comm.nRanks;
+  const int rank = ncclShmem.comm.rank;
 
-  ssize_t count, gridOffset, channelCount, chunkCount;
-  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count,
-                  &gridOffset, &channelCount, &chunkCount);
-  if (channelCount == 0) return;
+  const BinePart P = binePartition<T, Proto>(work, nRanks, /*allowPos=*/true);
+  if (P.idle) return;
+  const ssize_t count = P.count;
 
   const T *sendBuf = (const T *)work->sendbuff;
   T *recvBuf = (T *)work->recvbuff;
-  const int rank = ncclShmem.comm.rank;
   const int myIdx = bineSendIndex(bine->index, rank, steps);
 
-  // Local copy: fuse it into the step-0 send when possible (as the ring does).
+  auto owns = [&](int pos) { return pos >= P.ownLo && pos < P.ownHi; };
+  auto blkOf = [&](int pos) { return bineSendOrder(bine->order, pos, steps); };
+
+  // Own block (block `rank`, position myIdx). Fused into the step-0 send when
+  // sendBuf does not alias recvBuf; the partner's direct write could otherwise
+  // hit my source. Only the channel that owns position myIdx touches it.
   const bool inPlace = (sendBuf == recvBuf + (ssize_t)rank * count);
   const bool fuseCopy = !inPlace && steps > 0 &&
                         bineSendPartner(bine->partners, rank, 0, steps) >= 0;
-  if (!inPlace && !fuseCopy) {  // fallback for ranks idle at step 0
-    T *mySeg = recvBuf + (ssize_t)rank * count;
-    for (ssize_t e = tid; e < channelCount; e += nthreads)
-      mySeg[gridOffset + e] = sendBuf[gridOffset + e];
+  if (!inPlace && !fuseCopy) {  // fallback: plain local copy, then barrier
+    if (owns(myIdx)) {
+      T *mySeg = recvBuf + (ssize_t)rank * count;
+      for (ssize_t e = tid; e < P.channelCount; e += nthreads)
+        mySeg[P.gridOffset + e] = sendBuf[P.gridOffset + e];
+    }
     __syncthreads();
   }
-
-  // Inside a step, sends and recvs are independent -> separate thread groups.
-  const int nSend = (nthreads / 2 / WARP_SIZE) * WARP_SIZE;
-  const bool isSender = tid < nSend;
 
   for (int s = 0; s < steps; ++s) {
     const int partner = bineSendPartner(bine->partners, rank, s, steps);
@@ -679,35 +695,28 @@ __device__ __forceinline__ void runBineBlockByBlock(int tid, int nthreads,
       const bool keepLower = ((myIdx >> s) & 1) == 0;
       const int sendBeg = keepLower ? base : base + span;
       const int recvBeg = keepLower ? base + span : base;
-      int peers[1] = {partner};
 
-      if (isSender) {
-        Primitives<T, RedOp, FanAsymmetric<0, 1>, /*Direct=*/1, Proto, 0> prims(
-            tid, nSend, peers, peers, sendBuf, recvBuf, work->redOpArg,
-            0 * Proto::MaxGroupWidth, 0, 0, work);
-        for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-          const ssize_t dataOff = gridOffset + elem;
-          const int ne = (int)min(chunkCount, channelCount - elem);
-          for (int j = 0; j < span; ++j) {
-            const int blk = bineSendOrder(bine->order, sendBeg + j, steps);
-            const ssize_t off = (ssize_t)blk * count + dataOff;
-            if (s == 0 && fuseCopy) prims.directCopySend(dataOff, off, ne);  // blk == rank
-            else                    prims.directSendFromOutput(off, ne);
-          }
-        }
-      } else {
-        Primitives<T, RedOp, FanAsymmetric<1, 0>, /*Direct=*/1, Proto, 0> prims(
-            tid - nSend, nthreads - nSend, peers, peers, sendBuf, recvBuf,
-            work->redOpArg, 1 * Proto::MaxGroupWidth, 0, 0, work);
-        for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
-          const ssize_t dataOff = gridOffset + elem;
-          const int ne = (int)min(chunkCount, channelCount - elem);
-          for (int j = 0; j < span; ++j) {
-            const int blk = bineSendOrder(bine->order, recvBeg + j, steps);
-            prims.directRecv((ssize_t)blk * count + dataOff, ne);
-          }
-        }
-      }
+      // Clip to the positions this channel owns (no-op in slice mode).
+      const int sLo = max(sendBeg, P.ownLo), sHi = min(sendBeg + span, P.ownHi);
+      const int rLo = max(recvBeg, P.ownLo), rHi = min(recvBeg + span, P.ownHi);
+      const bool copyHere = (s == 0 && fuseCopy);  // sendBeg == myIdx, blk == rank
+
+      bineSendRecvSplit<T, RedOp, Proto>(
+          tid, nthreads, work, sendBuf, recvBuf, partner, partner, sHi > sLo,
+          rHi > rLo,
+          [&](auto &prims) {
+            bineForMapped(sLo, sHi, P, blkOf, [&](ssize_t off, int n) {
+              if (copyHere)
+                prims.directCopySend(off - (ssize_t)rank * count, off, n);
+              else
+                prims.directSendFromOutput(off, n);
+            });
+          },
+          [&](auto &prims) {
+            bineForMapped(rLo, rHi, P, blkOf, [&](ssize_t off, int n) {
+              prims.directRecv(off, n);
+            });
+          });
     }
     __syncthreads();  // step s+1 sends what step s received
   }
