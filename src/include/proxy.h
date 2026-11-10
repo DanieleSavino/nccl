@@ -106,6 +106,9 @@ struct ncclProxyOp {
   size_t bineChannelCount;
   size_t bineChunkCount;
   size_t bineSlotElems;
+  int bineNChannels;   // channelHi - channelLo + 1
+  int bineChanIdx;     // channelId - channelLo
+  int bineEltSize;     // ncclTypeSize(datatype)
 
   // Profiler plugin
   union {

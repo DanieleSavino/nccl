@@ -785,6 +785,9 @@ static ncclResult_t scheduleCollTasksToPlan(
           proxyOp->bineChannelCount  = chCnt;
           proxyOp->bineChunkCount    = chunk;
           proxyOp->bineSlotElems     = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS / elementSize;
+          proxyOp->bineNChannels = (int)devWork->channelHi - (int)devWork->channelLo + 1;
+          proxyOp->bineChanIdx   = c - (int)devWork->channelLo;
+          proxyOp->bineEltSize   = (int)elementSize;
         }
 
         proxyOp->eActivationMask = task->eActivationMask;

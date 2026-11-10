@@ -153,4 +153,23 @@ struct ncclBinePreorder {
   }
 };
 
+#ifndef BINE_POS_SLICE_BYTES
+#define BINE_POS_SLICE_BYTES (16 * 1024)
+#endif
+
+struct BineOwn { int lo, hi; bool pos; };
+
+NCCL_HOST_DEVICE_INLINE static BineOwn
+bineOwnRange(size_t count, size_t eltSize, int nCh, int chIdx, int nRanks, bool allowPos) {
+  BineOwn o; o.lo = 0; o.hi = nRanks; o.pos = false;
+  if (allowPos && nCh > 1 && nRanks >= nCh &&
+      count * eltSize < (size_t)nCh * BINE_POS_SLICE_BYTES) {
+    const int per = (nRanks + nCh - 1) / nCh;
+    const int lo = chIdx * per < nRanks ? chIdx * per : nRanks;
+    const int hi = lo + per < nRanks ? lo + per : nRanks;
+    o.lo = lo; o.hi = hi; o.pos = true;
+  }
+  return o;
+}
+
 #endif // NCCL_BINE_H_

@@ -237,7 +237,7 @@ ncclResult_t ncclTransportBineConnect(struct ncclComm* comm) {
           addPeer(redistFrom, true, true);
         }
       }
-      if (channel->binePartner != nullptr) {
+      if (channel->binePartner != nullptr && buffMan != DOUBLE_SEND) {
         for (int s = 0; s < doublingSteps; ++s)
           addPeer(bineSendPartner(channel->binePartner, comm->rank, s, doublingSteps), true, true);
       }

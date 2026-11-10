@@ -130,10 +130,6 @@ __device__ __forceinline__ void bineInPlacePermute(
 //   enter, so it is identical on all ranks and channels.
 // ============================================================================
 
-#ifndef BINE_POS_SLICE_BYTES
-#define BINE_POS_SLICE_BYTES (16 * 1024)
-#endif
-
 // Fuse the final local copy into the last recvReduceCopy (writes straight
 // into recvbuff, like the ring does). Set to 0 to fall back to a trailing copy.
 #ifndef BINE_RS_FUSE_FINAL

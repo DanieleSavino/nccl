@@ -244,22 +244,6 @@ __device__ __forceinline__ void runBinePermutationPat(int tid, int nthreads, ncc
     });
 }
 
-// Bine allgather "Send" and "Permutation" variants, reworked like the new
-// runBineBlockByBlock:
-//   * sends and recvs run in separate thread groups (separate Primitives)
-//   * the local copy of my block is fused into the step-0 send (directCopySend)
-//   * nothing is ever sent in pieces larger than chunkCount
-//   * (Send variant only) optional stride-free partition across channels
-//
-// NOT COMPILED OR RUN: written against the NCCL device headers from memory.
-// Lines marked VERIFY depend on field/ctor names in your tree.
-
-// Below this many bytes per rank per *channel* we stop slicing every block
-// across channels and instead give each channel a contiguous range of
-// positions (Send variant only). Tune it.
-#ifndef BINE_POS_SLICE_BYTES
-#define BINE_POS_SLICE_BYTES (64 * 1024 * 1024)
-#endif
 
 // ---------------------------------------------------------------------------
 // Work partition
@@ -292,9 +276,12 @@ __device__ __forceinline__ BinePart binePartition(ncclDevWorkColl *work,
   P.ownHi = nRanks;
   P.idle = (P.channelCount == 0) || (P.count == 0);
 
-  // VERIFY: channelLo / channelHi are what ncclCollCbdPart uses internally.
-  const int nCh = (int)work->channelHi - (int)work->channelLo + 1;
+  const int nCh   = (int)work->channelHi - (int)work->channelLo + 1;
   const int chIdx = (int)ncclShmem.channelId - (int)work->channelLo;
+  BineOwn o = bineOwnRange(P.count, sizeof(T), nCh, chIdx, nRanks, allowPosPartition);
+  P.ownLo = o.lo; P.ownHi = o.hi;
+  if (o.pos) { P.gridOffset = 0; P.channelCount = P.count;
+              P.idle = (o.lo >= o.hi) || (P.count == 0); }
 
   // Must depend only on values that are identical on every rank and channel.
   const bool posPart =

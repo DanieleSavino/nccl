@@ -859,6 +859,148 @@ static ncclResult_t SaveProxyBineArTree(struct ncclComm* comm, struct ncclChanne
   return ncclSuccess;
 }
 
+struct BineHostPart {
+  ssize_t count, channelCount, chunkCount;
+  int ownLo, ownHi;
+  bool idle;
+};
+
+static BineHostPart bineHostPartition(const struct ncclProxyOp* op, int nRanks, bool allowPos) {
+  BineHostPart P;
+  P.count = op->bineCount;
+  P.channelCount = op->bineChannelCount;
+  P.chunkCount = op->bineChunkCount;
+  P.idle = (P.channelCount == 0) || (P.count == 0);
+  BineOwn o = bineOwnRange((size_t)P.count, (size_t)op->bineEltSize, op->bineNChannels,
+                           op->bineChanIdx, nRanks, allowPos);
+  P.ownLo = o.lo; P.ownHi = o.hi;
+  if (o.pos) {
+    P.channelCount = P.count;
+    P.idle = (o.lo >= o.hi) || (P.count == 0);
+  }
+  return P;
+}
+
+static inline ssize_t bineCeil(ssize_t a, ssize_t b) { return (a + b - 1) / b; }
+
+// Mirrors bineForRange: number of fn() calls.
+static int bineXfersRange(int lo, int hi, const BineHostPart& P) {
+  if (hi <= lo) return 0;
+  if (P.channelCount == P.count)
+    return (int)bineCeil((ssize_t)(hi - lo) * P.count, P.chunkCount);
+  return (int)(bineCeil(P.channelCount, P.chunkCount) * (hi - lo));
+}
+
+// Mirrors bineForMapped (always chunk-outer, block-inner).
+static int bineXfersMapped(int lo, int hi, const BineHostPart& P) {
+  if (hi <= lo) return 0;
+  return (int)(bineCeil(P.channelCount, P.chunkCount) * (hi - lo));
+}
+
+// Mirrors bineForCircRange.
+static int bineXfersCirc(int start, int span, int nRanks, const BineHostPart& P) {
+  const int end = start + span;
+  int n = bineXfersRange(std::max(start, P.ownLo), std::min(std::min(end, nRanks), P.ownHi), P);
+  if (end > nRanks) n += bineXfersRange(P.ownLo, std::min(end - nRanks, P.ownHi), P);
+  return n;
+}
+
+static ncclResult_t bineReg(struct ncclComm* comm, struct ncclChannel* channel,
+                            struct ncclProxyOp* op, bool* justInquire,
+                            int peer, bool isRecv, int nXfers, int chunkSteps) {
+  if (nXfers <= 0) return ncclSuccess;
+  op->nsteps = nXfers * chunkSteps;
+  return SaveProxy(comm, channel, isRecv ? proxyRecv : proxySend, peer, op, 0, justInquire);
+}
+
+// Non-PAT butterfly AllGather: SEND / PERMUTATION / DOUBLE_SEND / BLOCK_BY_BLOCK.
+// One proxy step per kernel transfer (n <= chunkCount). Registration order per
+// connection must equal kernel order.
+static ncclResult_t SaveProxyBineAgButterfly(struct ncclComm* comm, struct ncclChannel* channel,
+                                             struct ncclProxyOp* op, bool* justInquire,
+                                             int chunkSteps) {
+  const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
+  const int steps = channel->bine.nDoublingSteps;
+  const int nRanks = comm->nRanks;
+  const int rank = comm->rank;
+
+  const bool allowPos = (buffMan != PERMUTATION);      // must match binePartition calls
+  const BineHostPart P = bineHostPartition(op, nRanks, allowPos);
+  if (P.idle) return ncclSuccess;                      // kernel returns early too
+
+  auto owns = [&](int pos) { return pos >= P.ownLo && pos < P.ownHi; };
+  const int xfersPerBlock = (int)bineCeil(P.channelCount, P.chunkCount);
+
+  if (buffMan == DOUBLE_SEND) {
+    if (channel->dhlvBinePartner == nullptr) {
+      WARN("BINE DOUBLE_SEND: dhlv partner table missing");
+      return ncclInternalError;
+    }
+    const int p = nRanks;
+    int a = rank;
+    for (int s = steps - 1; s >= 0; --s) {
+      const int g = steps - 1 - s;
+      const int span = 1 << g;
+      const bool sendBottom = ((rank & 1) == (g & 1));
+      const int sendStart = a;
+      const int recvStart = sendBottom ? (a - span + p) % p : (a + span) % p;
+      if (sendBottom) a = recvStart;                   // update even if inactive (kernel does)
+
+      const int partner = channel->dhlvBinePartner[rank * steps + s];
+      if (partner < 0 || partner == rank) continue;
+      NCCLCHECK(bineReg(comm, channel, op, justInquire, partner, true,
+                        bineXfersCirc(recvStart, span, p, P), chunkSteps));
+      NCCLCHECK(bineReg(comm, channel, op, justInquire, partner, false,
+                        bineXfersCirc(sendStart, span, p, P), chunkSteps));
+    }
+    return ncclSuccess;
+  }
+
+  // SEND / PERMUTATION / BLOCK_BY_BLOCK share the position-space butterfly.
+  if (channel->bineIndex == nullptr || channel->binePartner == nullptr) {
+    WARN("BINE index/partner tables are missing for AG butterfly");
+    return ncclInternalError;
+  }
+  const int myIdx = bineSendIndex(channel->bineIndex, rank, steps);
+
+  // SEND pre-step: block `rank` -> position `rank` on redistTo.
+  if (buffMan == SEND) {
+    if (channel->bineOrder == nullptr) {
+      WARN("BINE order table missing for SEND");
+      return ncclInternalError;
+    }
+    const int redistTo = bineSendOrder(channel->bineOrder, rank, steps);
+    const int redistFrom = myIdx;
+    if (redistTo != rank) {
+      NCCLCHECK(bineReg(comm, channel, op, justInquire, redistFrom, true,
+                        owns(myIdx) ? xfersPerBlock : 0, chunkSteps));
+      NCCLCHECK(bineReg(comm, channel, op, justInquire, redistTo, false,
+                        owns(rank) ? xfersPerBlock : 0, chunkSteps));
+    }
+  }
+
+  for (int s = 0; s < steps; ++s) {
+    const int partner = bineSendPartner(channel->binePartner, rank, s, steps);
+    if (partner < 0) continue;
+    const int span = 1 << s;
+    const int base = (myIdx >> (s + 1)) << (s + 1);
+    const bool keepLower = ((myIdx >> s) & 1) == 0;
+    const int sendBeg = keepLower ? base : base + span;
+    const int recvBeg = keepLower ? base + span : base;
+    const int sLo = std::max(sendBeg, P.ownLo), sHi = std::min(sendBeg + span, P.ownHi);
+    const int rLo = std::max(recvBeg, P.ownLo), rHi = std::min(recvBeg + span, P.ownHi);
+
+    int nS, nR;
+    if (buffMan == BLOCK_BY_BLOCK) { nS = bineXfersMapped(sLo, sHi, P); nR = bineXfersMapped(rLo, rHi, P); }
+    else                           { nS = bineXfersRange(sLo, sHi, P);  nR = bineXfersRange(rLo, rHi, P); }
+
+    NCCLCHECK(bineReg(comm, channel, op, justInquire, partner, true,  nR, chunkSteps));
+    NCCLCHECK(bineReg(comm, channel, op, justInquire, partner, false, nS, chunkSteps));
+  }
+  // PERMUTATION's final in-place permutation is local: no proxy ops.
+  return ncclSuccess;
+}
+
 static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *channel,
                                   struct ncclProxyOp *op, bool *justInquire) {
   const ncclBineBufferManagement_t buffMan = channel->bine.bufferManagement;
@@ -932,6 +1074,12 @@ static ncclResult_t SaveProxyBine(struct ncclComm *comm, struct ncclChannel *cha
       op->nsteps = savedNsteps;
       return ncclSuccess;
     }
+  }
+
+  if (hasDoubling && bineVar == BUTTERFLY && op->coll == ncclFuncAllGather) {
+    NCCLCHECK(SaveProxyBineAgButterfly(comm, channel, op, justInquire, chunkSteps));
+    op->nsteps = savedNsteps;
+    return ncclSuccess;
   }
 
   // ---- Doubling phase ----
